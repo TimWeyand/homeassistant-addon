@@ -1,5 +1,5 @@
 ARG BUILD_ARCH
-FROM ghcr.io/home-assistant/${BUILD_ARCH}-python:3.10-alpine3.14
+FROM ghcr.io/home-assistant/${BUILD_ARCH}-base-python:3.10-alpine3.14
 
 RUN apk add git bash \
  && cd /opt \
