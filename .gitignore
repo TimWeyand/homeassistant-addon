@@ -1,3 +1,4 @@
 .idea
 .github/.DS_Store
 .DS_Store
+/go.mod
