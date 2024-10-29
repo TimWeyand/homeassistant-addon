@@ -4,7 +4,7 @@ on: [push, pull_request]
 
 jobs:
   sma_battery_publish:
-    name: Publish
+    name: Publish SMA Battery Controller
     runs-on: ubuntu-latest
     steps:
       - name: Checkout the repository
@@ -22,7 +22,7 @@ jobs:
             --target SMA_Battery_Controller \
             --docker-hub ${{ secrets.DOCKERHUB_USERNAME}}
   comfoair_publish:
-    name: Publish
+    name: Publish Comfoair2MQTT
     runs-on: ubuntu-latest
     steps:
       - name: Checkout the repository
