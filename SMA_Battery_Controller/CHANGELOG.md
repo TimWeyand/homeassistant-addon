@@ -1,6 +1,13 @@
 # Changelog
 **Warning:** This is not an official add-on and is not affiliated with SMA. Use at your own risk. This software is experimental.
 
+## 0.0.25
+- **Fixed PV-aware switching issues:**
+  - Added initial sensor value publishing for `actual_charging_power_setting` and `internal_mode_reason`
+  - Fixed control logic not being applied on startup (now applies after first sensor read)
+  - Enhanced `checkPauseChargeOkMode()` to always evaluate PV-aware modes ("Pause (charge ok)" and "Charge Battery")
+  - Ensures immediate response to PV changes without waiting for reset timer
+
 ## 0.0.24
 - **Critical Bug Fixes:**
   - Fixed race condition in sensor value access between goroutines (added `sensorMu` mutex protection)

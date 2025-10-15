@@ -239,6 +239,12 @@ func publishDiscoveryMessages() {
 	publishSensor("modbus_error_count", "Modbus Error Count", "", deviceInfo)
 	publishSensor("internal_mode_reason", "Internal Mode Reason", "", deviceInfo)
 	publishSensor("actual_charging_power_setting", "Actual Charging Power Setting", "W", deviceInfo)
+
+	// Publish initial values for the new sensors
+	stateTopic := sensorTopicPrefix + "internal_mode_reason/state"
+	mqttPublish(stateTopic, []byte("Starting"), false)
+	stateTopic = sensorTopicPrefix + "actual_charging_power_setting/state"
+	mqttPublish(stateTopic, []byte("0"), false)
 }
 
 func publishSelect(objectID, name string, options []string, initial string, deviceInfo map[string]interface{}) {
@@ -377,6 +383,11 @@ func modbusReadLoop() {
 	fastTicker := time.NewTicker(1 * time.Second)
 	resetTicker := time.NewTicker(time.Duration(resetIntervalMinutes) * time.Minute) // periodic control logic check
 	fullPublishTicker := time.NewTicker(30 * time.Minute)                            // force full sensor publish every 30 minutes
+
+	// Do initial read and apply control logic
+	readAndPublishData()
+	applyControlLogic()
+
 	for {
 		select {
 		case <-fastTicker.C:
@@ -512,6 +523,11 @@ func checkPauseChargeOkMode() {
 	}
 	// Continuously react in Balanced only when Overwrite is actively set to Balanced (not in Automatic mode)
 	if overwriteLogicSelection == "Balanced" {
+		applyControlLogic()
+		return
+	}
+	// For Pause (charge ok) and Charge Battery modes, always check if we need to switch
+	if currentMode == "Pause (charge ok)" || currentMode == "Charge Battery" {
 		applyControlLogic()
 		return
 	}
