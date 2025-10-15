@@ -1,0 +1,18 @@
+# Binary executables
+sma_battery_controller
+SMA_TripowerSE_Battery_MQTT
+
+# Go build artifacts
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool
+*.out
+
+# Go workspace file
+go.work

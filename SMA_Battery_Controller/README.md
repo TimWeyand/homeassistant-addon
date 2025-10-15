@@ -16,14 +16,15 @@ The add-on allows you to:
 ## Features
 
 - **Modbus TCP Communication**: Direct communication with the SMA inverter over Modbus TCP.
-- **MQTT Integration**: Uses MQTT for communication with Home Assistant, supporting MQTT auto-discovery.
+- **MQTT Integration**: Uses MQTT for communication with Home Assistant, supporting MQTT auto-discovery and retained states.
 - **Battery Control Modes**:
     - **Automatic**: Default mode where the inverter operates automatically.
+    - **Balanced**: Grid-balancing discharge logic. On entry, battery_control is set to 0 or to the current grid_draw (clamped), and only discharge commands are issued. When charging is active and grid is near zero, Balanced stays automatic (no discharge). Fast 1-second polling is enabled only while actively discharging in Balanced.
     - **Pause (charge ok)**: Pauses discharging; charging is allowed.
     - **Pause**: Pauses both charging and discharging.
     - **Charge Battery**: Forces the battery to charge at a specified power level.
     - **Discharge Battery**: Forces the battery to discharge at a specified power level.
-- **Battery Control Input**: Set a custom power level for charging or discharging, within a configurable maximum limit.
+- **Battery Control Input**: Set a custom power level for charging or discharging, within a configurable maximum limit. The value is published retained and loaded on startup (including 0).
 - **Automatic Reset**: Option to reset the Overwrite Logic Selection to "Automatic" after a specified interval.
 - **Debug Logging**: Detailed logging for troubleshooting when enabled.
 
@@ -110,11 +111,15 @@ The add-on uses MQTT auto-discovery to integrate with Home Assistant. After star
     - AC Power (`sensor.ac_power`)
     - Grid Feed Power (`sensor.grid_feed`)
     - Grid Draw Power (`sensor.grid_draw`)
+    - Internal Mode Reason (`sensor.internal_mode_reason`) - Explains internal automatic switching
+    - Actual Charging Power Setting (`sensor.actual_charging_power_setting`) - Shows actual commanded power
 
 - **Controls**:
     - Automatic Logic Selection (`select.automatic_logic_selection`)
     - Overwrite Logic Selection (`select.overwrite_logic_selection`)
     - Battery Control (`number.battery_control`)
+- **Read-only**:
+    - Current Logic Selection (`sensor.current_logic_selection`)
 
 ### Using the Controls
 
@@ -129,10 +134,19 @@ The add-on uses MQTT auto-discovery to integrate with Home Assistant. After star
 - **Automatic**: The inverter operates in its default automatic mode.
 
 - **Pause (charge ok)**: The battery will not discharge; it will charge if possible.
+  - **PV-aware switching**: Automatically switches to automatic mode when excess PV is detected (grid feed > 100W)
+  - Reverts to pause when battery starts discharging (> 100W)
 
 - **Pause**: The battery will neither charge nor discharge.
 
 - **Charge Battery**: Forces the battery to charge at the specified power level set in Battery Control.
+  - **PV-aware switching**: Automatically switches to automatic mode when significant excess PV is detected (grid feed > 500W)
+  - Reverts to forced charging when battery charging drops below (set value - 500W)
+  - **SOC-based tapering**: Automatically reduces charging power at high SOC levels to protect battery health:
+    - 80-85% SOC: Max 80% of maximum power
+    - 85-90% SOC: Max 60% of maximum power
+    - 90-95% SOC: Max 30% of maximum power
+    - 95-100% SOC: Max 15% of maximum power
 
 - **Discharge Battery**: Forces the battery to discharge at the specified power level set in Battery Control.
 

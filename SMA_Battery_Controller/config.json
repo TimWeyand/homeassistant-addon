@@ -1,6 +1,6 @@
 {
   "name": "SMA Battery Controller",
-  "version": "0.0.8",
+  "version": "0.0.24",
   "slug": "sma_battery_controller",
   "description": "Control your SMA Sunny Tripower SE 10 inverter battery over MQTT",
   "startup": "application",
@@ -28,7 +28,8 @@
     "debug_enabled": true,
     "modbus_interval_in_seconds": 5,
     "reset_interval_minutes": 5,
-    "device_id": "sma_battery_controller"
+    "device_id": "sma_battery_controller",
+    "post_command_delay_ms": 1600
   },
   "schema": {
     "mqtt_server_address": "str?",
@@ -41,7 +42,8 @@
     "debug_enabled": "bool?",
     "modbus_interval_in_seconds": "int?",
     "reset_interval_minutes": "int?",
-    "device_id": "str?"
+    "device_id": "str?",
+    "post_command_delay_ms": "int?"
   },
   "image": "tweyand/sma_battery_controller-{arch}"
 }
