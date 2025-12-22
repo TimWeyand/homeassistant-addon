@@ -18,7 +18,8 @@ jobs:
         uses: home-assistant/builder@master
         with:
           args: |
-            --all \
+            --amd64 \
+            --aarch64 \
             --target SMA_Battery_Controller \
             --docker-hub ${{ secrets.DOCKERHUB_USERNAME}}
   comfoair_publish:
@@ -36,6 +37,7 @@ jobs:
         uses: home-assistant/builder@master
         with:
           args: |
-            --all \
+            --amd64 \
+            --aarch64 \
             --target comfoair2mqtt \
             --docker-hub ${{ secrets.DOCKERHUB_USERNAME}}

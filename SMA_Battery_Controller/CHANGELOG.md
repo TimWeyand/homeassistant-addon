@@ -2,6 +2,9 @@
 **Warning:** This is not an official add-on and is not affiliated with SMA. Use at your own risk. This software is experimental.
 
 ## 0.0.26
+- **Build system update:**
+  - Updated GitHub Actions workflow to use explicit `--amd64 --aarch64` instead of deprecated `--all`
+  - Removed unsupported architectures (armhf, armv7, i386) - Home Assistant builder now only supports amd64 and aarch64
 - **Case-insensitive mode handling:**
   - All mode comparisons are now case-insensitive (e.g., "pause (charge ok)", "PAUSE (CHARGE OK)", "Pause (Charge Ok)" all work)
   - Added `normalizeMode()` function that maps any case variation to the canonical form
