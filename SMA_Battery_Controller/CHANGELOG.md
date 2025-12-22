@@ -1,6 +1,21 @@
 # Changelog
 **Warning:** This is not an official add-on and is not affiliated with SMA. Use at your own risk. This software is experimental.
 
+## 0.0.26
+- **Case-insensitive mode handling:**
+  - All mode comparisons are now case-insensitive (e.g., "pause (charge ok)", "PAUSE (CHARGE OK)", "Pause (Charge Ok)" all work)
+  - Added `normalizeMode()` function that maps any case variation to the canonical form
+  - Invalid/unknown modes now safely fallback to "Automatic" with a WARNING log (always logged, not just in debug mode)
+- **Battery control validation in Pause modes:**
+  - Battery control value changes are now ignored in "Pause (charge ok)" and "Pause" modes
+  - Values are still stored but not applied, preventing accidental charging from grid
+  - Logged warning when battery control is set but ignored due to pause mode
+- **Thread safety improvements:**
+  - Added mutex protection for all global mode variable access in MQTT handler
+  - `getCurrentMode()` is now thread-safe with proper locking
+  - Added `getCurrentModeUnsafe()` for internal use when lock is already held
+  - Prevents race conditions between MQTT handler and control logic goroutines
+
 ## 0.0.25
 - **Fixed PV-aware switching issues:**
   - Added initial sensor value publishing for `actual_charging_power_setting` and `internal_mode_reason`

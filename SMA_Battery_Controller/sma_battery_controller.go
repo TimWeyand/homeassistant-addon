@@ -392,7 +392,7 @@ func modbusReadLoop() {
 		select {
 		case <-fastTicker.C:
 			// When Balanced overwrite is active AND we're actually in discharge activity, poll every second
-			if overwriteLogicSelection == "Balanced" {
+			if normalizeMode(overwriteLogicSelection) == "Balanced" {
 				// Active balanced discharge mode if:
 				// - battery_control > 0
 				// - not actively charging (battery_charge_power below threshold)
@@ -416,7 +416,7 @@ func modbusReadLoop() {
 			localGridDraw := gridDraw
 			localGridFeed := gridFeed
 			sensorMu.Unlock()
-			if overwriteLogicSelection != "Balanced" || !(batteryControl > 0 && localBatteryChargePower < chargeActiveW && (localBatteryDischargePower > 0 || localGridDraw > nearZeroW || localGridFeed > nearZeroW)) {
+			if normalizeMode(overwriteLogicSelection) != "Balanced" || !(batteryControl > 0 && localBatteryChargePower < chargeActiveW && (localBatteryDischargePower > 0 || localGridDraw > nearZeroW || localGridFeed > nearZeroW)) {
 				readAndPublishData()
 				checkPauseChargeOkMode()
 			}
@@ -515,14 +515,12 @@ func readAndPublishData() {
 }
 
 func checkPauseChargeOkMode() {
-	var currentMode string
-	if overwriteLogicSelection != "Off" {
-		currentMode = overwriteLogicSelection
-	} else {
-		currentMode = automaticLogicSelection
-	}
+	// Use normalized mode for case-insensitive comparison
+	currentMode := getCurrentMode()
+	normalizedOverwrite := normalizeMode(overwriteLogicSelection)
+
 	// Continuously react in Balanced only when Overwrite is actively set to Balanced (not in Automatic mode)
-	if overwriteLogicSelection == "Balanced" {
+	if normalizedOverwrite == "Balanced" {
 		applyControlLogic()
 		return
 	}
@@ -544,13 +542,10 @@ func applyControlLogic() {
 	defer controlMu.Unlock()
 	var spntCom uint32 = 0
 	var pwrAtCom int32 = 0
-	var currentMode string
 
-	if overwriteLogicSelection != "Off" {
-		currentMode = overwriteLogicSelection
-	} else {
-		currentMode = automaticLogicSelection
-	}
+	// Use normalized mode for case-insensitive comparison
+	// Note: Using unsafe version since we already hold controlMu
+	currentMode := getCurrentModeUnsafe()
 
 	if currentMode != currentLogicSelection {
 		currentLogicSelection = currentMode
@@ -757,7 +752,7 @@ func applyMode(mode string, spntCom *uint32, pwrAtCom *int32) {
 		publishActualChargingPower(0)
 	case "Balanced":
 		// Only send Balanced commands when Overwrite is actively set to Balanced; otherwise do nothing (no writes)
-		if overwriteLogicSelection != "Balanced" {
+		if normalizeMode(overwriteLogicSelection) != "Balanced" {
 			*spntCom = 0
 			*pwrAtCom = 0
 			if debugEnabled {
@@ -982,14 +977,21 @@ func mqttMessageHandler(client mqtt.Client, msg mqtt.Message) {
 	switch entityType {
 	case "select":
 		if objectID == "automatic_logic_selection" {
-			automaticLogicSelection = payload
+			// Normalize the mode for case-insensitive matching
+			normalizedPayload := normalizeMode(payload)
+			// Protect write access to global variable
+			controlMu.Lock()
+			automaticLogicSelection = normalizedPayload
+			controlMu.Unlock()
 			stateTopic := fmt.Sprintf("homeassistant/select/%s/%s/state", deviceID, objectID)
-			mqttPublish(stateTopic, []byte(payload), true)
+			mqttPublish(stateTopic, []byte(normalizedPayload), true)
 			applyControlLogic()
 			lastChangeTime = time.Now()
 		} else if objectID == "overwrite_logic_selection" {
+			// Normalize the mode for case-insensitive matching
+			normalizedPayload := normalizeMode(payload)
 			// If switching to Balanced, initialize battery_control to 0 or the required discharge value
-			if payload == "Balanced" {
+			if normalizedPayload == "Balanced" {
 				// Determine initial battery control for Balanced
 				var newBC int
 				sensorMu.Lock()
@@ -1007,16 +1009,24 @@ func mqttMessageHandler(client mqtt.Client, msg mqtt.Message) {
 				} else {
 					newBC = 0
 				}
+				// Protect write access to global variables
+				controlMu.Lock()
 				if batteryControl != newBC {
 					batteryControl = newBC
 					lastValidBatteryControl = newBC
+					controlMu.Unlock()
 					bcStateTopic := fmt.Sprintf("homeassistant/number/%s/%s/state", deviceID, "battery_control")
 					mqttPublish(bcStateTopic, []byte(strconv.Itoa(newBC)), true)
+				} else {
+					controlMu.Unlock()
 				}
 			}
-			overwriteLogicSelection = payload
+			// Protect write access to global variable
+			controlMu.Lock()
+			overwriteLogicSelection = normalizedPayload
+			controlMu.Unlock()
 			stateTopic := fmt.Sprintf("homeassistant/select/%s/%s/state", deviceID, objectID)
-			mqttPublish(stateTopic, []byte(payload), true)
+			mqttPublish(stateTopic, []byte(normalizedPayload), true)
 			applyControlLogic()
 			lastChangeTime = time.Now()
 		}
@@ -1024,18 +1034,41 @@ func mqttMessageHandler(client mqtt.Client, msg mqtt.Message) {
 		if objectID == "battery_control" {
 			value, err := strconv.Atoi(payload)
 			if err == nil && value >= 0 && value <= maximumBatteryControl {
+				// Check current mode - ignore battery_control changes in Pause modes
+				currentMode := getCurrentMode()
+				if currentMode == "Pause (charge ok)" || currentMode == "Pause" {
+					// In Pause modes, battery_control changes are ignored
+					// Keep the value stored but don't apply it
+					controlMu.Lock()
+					batteryControl = value
+					lastValidBatteryControl = value
+					controlMu.Unlock()
+					stateTopic := fmt.Sprintf("homeassistant/number/%s/%s/state", deviceID, objectID)
+					mqttPublish(stateTopic, []byte(payload), true)
+					if debugEnabled {
+						log.Printf("Battery control set to %d but ignored in %s mode", value, currentMode)
+					}
+					// Don't call applyControlLogic() - the value is stored but not applied
+					return
+				}
+				// Protect write access to global variables
+				controlMu.Lock()
 				batteryControl = value
 				lastValidBatteryControl = value
+				controlMu.Unlock()
 				stateTopic := fmt.Sprintf("homeassistant/number/%s/%s/state", deviceID, objectID)
 				mqttPublish(stateTopic, []byte(payload), true)
 				applyControlLogic()
 				lastChangeTime = time.Now()
 			} else {
 				// Reset to last valid value
+				controlMu.Lock()
+				lastValid := lastValidBatteryControl
+				controlMu.Unlock()
 				stateTopic := fmt.Sprintf("homeassistant/number/%s/%s/state", deviceID, objectID)
-				mqttPublish(stateTopic, []byte(strconv.Itoa(lastValidBatteryControl)), true)
+				mqttPublish(stateTopic, []byte(strconv.Itoa(lastValid)), true)
 				if debugEnabled {
-					log.Printf("Invalid battery control value: %s. Resetting to last valid value: %d", payload, lastValidBatteryControl)
+					log.Printf("Invalid battery control value: %s. Resetting to last valid value: %d", payload, lastValid)
 				}
 			}
 		}
@@ -1074,4 +1107,48 @@ func int32ToBytes(value int32) []byte {
 	bytes := make([]byte, 4)
 	binary.BigEndian.PutUint32(bytes, uint32(value))
 	return bytes
+}
+
+// normalizeMode converts a mode string to its canonical form (case-insensitive matching)
+// Returns "Automatic" for invalid/unknown modes as a safe fallback
+func normalizeMode(mode string) string {
+	lower := strings.ToLower(strings.TrimSpace(mode))
+	switch lower {
+	case "automatic", "":
+		return "Automatic"
+	case "balanced":
+		return "Balanced"
+	case "pause (charge ok)", "pause(charge ok)", "pause (chargeok)", "pause(chargeok)":
+		return "Pause (charge ok)"
+	case "pause":
+		return "Pause"
+	case "charge battery", "chargebattery":
+		return "Charge Battery"
+	case "discharge battery", "dischargebattery":
+		return "Discharge Battery"
+	case "off":
+		return "Off"
+	default:
+		// Unknown mode - fallback to Automatic for safety
+		// Always log this warning, not just in debug mode
+		log.Printf("WARNING: Unknown mode '%s' received, falling back to 'Automatic'", mode)
+		return "Automatic"
+	}
+}
+
+// getCurrentModeUnsafe returns the effective current mode (normalized)
+// NOT thread-safe: caller must hold controlMu lock
+func getCurrentModeUnsafe() string {
+	if overwriteLogicSelection != "Off" && overwriteLogicSelection != "" {
+		return normalizeMode(overwriteLogicSelection)
+	}
+	return normalizeMode(automaticLogicSelection)
+}
+
+// getCurrentMode returns the effective current mode (normalized)
+// Thread-safe: uses controlMu to protect access to global mode variables
+func getCurrentMode() string {
+	controlMu.Lock()
+	defer controlMu.Unlock()
+	return getCurrentModeUnsafe()
 }
