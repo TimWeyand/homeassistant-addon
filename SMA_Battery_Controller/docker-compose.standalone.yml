@@ -1,0 +1,50 @@
+# Standalone Docker Compose for SMA Battery Controller
+# Use this for running outside of Home Assistant (e.g., on a NAS)
+#
+# Usage:
+#   docker-compose -f docker-compose.standalone.yml up -d
+#
+# Or pull pre-built image:
+#   docker pull tweyand/sma-battery-controller:latest
+
+services:
+  sma-battery-controller:
+    image: tweyand/sma-battery-controller:latest
+    container_name: sma-battery-controller
+    restart: unless-stopped
+    environment:
+      # MQTT Configuration
+      - MQTT_SERVER_ADDRESS=mqtt.home.weyand.biz
+      - MQTT_SERVER_PORT=1883
+      - MQTT_USER=power
+      - MQTT_PASSWORD=power
+
+      # SMA Inverter Modbus Configuration
+      - SMA_INVERTER_MODBUS_ADDRESS=192.168.250.24
+      - SMA_INVERTER_MODBUS_PORT=502
+
+      # Battery Control Settings
+      - MAXIMUM_BATTERY_CONTROL=5000
+      - DEBUG_ENABLED=false
+      - MODBUS_INTERVAL_IN_SECONDS=5
+      - RESET_INTERVAL_MINUTES=5
+
+      # Device Identity (change if running multiple instances)
+      - DEVICE_ID=sma_battery_controller
+
+      # Timing
+      - POST_COMMAND_DELAY_MS=1600
+
+      # Timezone
+      - TZ=Europe/Berlin
+
+    # Network mode: Use host network for Modbus access
+    # Alternative: Use bridge network with proper port exposure
+    network_mode: host
+
+    # Optional: Resource limits
+    # deploy:
+    #   resources:
+    #     limits:
+    #       memory: 128M
+    #       cpus: '0.5'

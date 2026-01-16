@@ -1,6 +1,15 @@
 # Changelog
 **Warning:** This is not an official add-on and is not affiliated with SMA. Use at your own risk. This software is experimental.
 
+## 0.0.28
+- **Standalone Docker Support:**
+  - Added `Dockerfile.standalone` for running outside of Home Assistant (e.g., on NAS/Unraid)
+  - Added `docker-compose.standalone.yml` with example configuration
+  - Multi-arch support: `linux/amd64` and `linux/arm64`
+  - New Docker image: `tweyand/sma-battery-controller:latest` (standalone)
+  - CI automatically builds and pushes standalone image alongside HA Add-on
+  - No code changes required - same Go binary, different packaging
+
 ## 0.0.27
 - **MQTT AutoReconnect Fix:**
   - Added `SetAutoReconnect(true)` - MQTT client now automatically reconnects after connection loss
