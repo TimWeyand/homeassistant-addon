@@ -1,6 +1,15 @@
 # Changelog
 **Warning:** This is not an official add-on and is not affiliated with SMA. Use at your own risk. This software is experimental.
 
+## 0.0.27
+- **MQTT AutoReconnect Fix:**
+  - Added `SetAutoReconnect(true)` - MQTT client now automatically reconnects after connection loss
+  - Added `SetMaxReconnectInterval(1 * time.Minute)` - limits reconnect backoff to 1 minute
+  - Added `SetConnectRetry(true)` with 10-second retry interval for initial connection
+  - Added `ConnectionLostHandler` - logs when connection is lost
+  - Added `OnConnectHandler` - re-subscribes to command topics after every reconnect
+  - **Critical fix**: Previously, after MQTT broker restart or network issues, the add-on would stop receiving commands until manually restarted
+
 ## 0.0.26
 - **Build system update:**
   - Updated GitHub Actions workflow to use explicit `--amd64 --aarch64` instead of deprecated `--all`

@@ -100,13 +100,8 @@ func main() {
 	// Start Modbus reading loop
 	go modbusReadLoop()
 
-	// Listen for MQTT messages
-	listenTopic := fmt.Sprintf("homeassistant/+/%s/+/set", deviceID)
-	token := mqttClient.Subscribe(listenTopic, 0, mqttMessageHandler)
-	token.Wait()
-	if debugEnabled {
-		log.Printf("Subscribed to: %s", listenTopic)
-	}
+	// MQTT Subscribe wird jetzt im OnConnectHandler gemacht (für AutoReconnect-Support)
+	// Das initiale Subscribe passiert automatisch beim ersten Connect
 
 	// Keep the application running
 	select {}
@@ -174,21 +169,45 @@ func setupMQTT() {
 	}
 	opts.SetClientID(deviceID)
 
+	// Enable AutoReconnect - KRITISCH für stabile MQTT-Verbindung!
+	opts.SetAutoReconnect(true)
+	opts.SetMaxReconnectInterval(1 * time.Minute)
+	opts.SetConnectRetry(true)
+	opts.SetConnectRetryInterval(10 * time.Second)
+
 	// Set Last Will and Testament (LWT)
 	willTopic := "smastp_modbus/status"
 	willPayload := "offline"
 	opts.SetWill(willTopic, willPayload, 0, true)
 
-	// Publish birth message after connection
-	opts.OnConnect = func(c mqtt.Client) {
+	// Connection Lost Handler - wird aufgerufen wenn Verbindung verloren geht
+	opts.SetConnectionLostHandler(func(c mqtt.Client, err error) {
+		log.Printf("[MQTT] Connection lost: %v - AutoReconnect wird versuchen, die Verbindung wiederherzustellen", err)
+	})
+
+	// OnConnect Handler - wird bei JEDER (Re-)Verbindung aufgerufen
+	opts.SetOnConnectHandler(func(c mqtt.Client) {
+		log.Println("[MQTT] Connected to broker")
+
+		// Publish birth message
 		birthTopic := "smastp_modbus/status"
 		birthPayload := "online"
 		token := c.Publish(birthTopic, 0, true, birthPayload)
 		token.Wait()
 		if debugEnabled {
-			log.Println("Published birth message to", birthTopic)
+			log.Println("[MQTT] Published birth message to", birthTopic)
 		}
-	}
+
+		// Re-Subscribe zu Command-Topics nach Reconnect
+		// Das ist KRITISCH - ohne Re-Subscribe werden keine Befehle mehr empfangen!
+		listenTopic := fmt.Sprintf("homeassistant/+/%s/+/set", deviceID)
+		token = c.Subscribe(listenTopic, 0, mqttMessageHandler)
+		if token.Wait() && token.Error() != nil {
+			log.Printf("[MQTT] Error re-subscribing to %s: %v", listenTopic, token.Error())
+		} else {
+			log.Printf("[MQTT] Re-subscribed to: %s", listenTopic)
+		}
+	})
 
 	// Create and start MQTT client
 	mqttClient = mqtt.NewClient(opts)
