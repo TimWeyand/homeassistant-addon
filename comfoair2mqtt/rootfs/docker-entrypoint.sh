@@ -88,4 +88,52 @@ HAAutoDiscoveryDeviceModel=$(bashio::config 'HAAutoDiscoveryDeviceModel')
 EOF
 
 bashio::log.info "Startup hacomfoairmqtt"
-python3 /opt/hacomfoairmqtt/src/ca350.py
+
+# --- Self-healing supervisor -------------------------------------------------
+# ca350.py is the upstream script (left untouched). If it ever exits — e.g. an
+# MQTT failure or an unhandled serial exception (upstream only catches
+# KeyboardInterrupt) terminates it — restart it automatically so the add-on
+# recovers without a manual restart. A clean stop from Home Assistant (SIGTERM)
+# breaks the loop instead of restarting.
+#
+# The restart delay uses exponential backoff (10s -> 300s) so a permanently
+# missing serial device does NOT cause a 10s restart storm. A process that ran
+# healthily for at least HEALTHY_RUNTIME seconds resets the backoff, so ordinary
+# crashes still recover quickly.
+RESTART_DELAY_MIN=10
+RESTART_DELAY_MAX=300
+HEALTHY_RUNTIME=60
+delay=${RESTART_DELAY_MIN}
+running=true
+child_pid=""
+
+term_handler() {
+    running=false
+    if [ -n "${child_pid}" ]; then
+        kill -TERM "${child_pid}" 2>/dev/null
+        wait "${child_pid}" 2>/dev/null
+    fi
+    exit 0
+}
+trap term_handler SIGTERM SIGINT
+
+while [ "${running}" = true ]; do
+    started=${SECONDS}
+    python3 /opt/hacomfoairmqtt/src/ca350.py &
+    child_pid=$!
+    wait "${child_pid}"
+    rc=$?
+    if [ "${running}" != true ]; then
+        break
+    fi
+    ran=$(( SECONDS - started ))
+    if [ "${ran}" -ge "${HEALTHY_RUNTIME}" ]; then
+        delay=${RESTART_DELAY_MIN}
+    fi
+    bashio::log.warning "ca350.py exited (code ${rc}) after ${ran}s; restarting in ${delay}s ..."
+    sleep "${delay}"
+    delay=$(( delay * 2 ))
+    if [ "${delay}" -gt "${RESTART_DELAY_MAX}" ]; then
+        delay=${RESTART_DELAY_MAX}
+    fi
+done

@@ -1,6 +1,15 @@
 # Changelog
 **Warning:** This is not an official add-on and is not affiliated with SMA. Use at your own risk. This software is experimental.
 
+## 0.0.29
+- **Self-healing supervisor (no more manual restarts):**
+  - `run.sh` now runs the Go binary inside a restart-supervisor loop instead of `exec`
+  - If the binary ever exits on its own (e.g. after sustained Modbus errors it calls `os.Exit`/`log.Fatal`), it is automatically restarted after 10s — the add-on recovers without a manual restart
+  - Clean stops from Home Assistant (SIGTERM/SIGINT) break the loop instead of restarting (proper `trap` handling, no orphaned child process)
+  - **Exponential backoff (10s → 300s)** on restarts: a permanently unreachable inverter (e.g. asleep at night, Modbus connect fails) no longer causes a 10s restart storm with the HA device flapping online/offline. A healthy run (≥60s) resets the backoff so ordinary crashes still recover quickly
+  - Complements the MQTT AutoReconnect from 0.0.27: MQTT drops are handled loss-free in-process; the supervisor only catches hard exits
+  - No Go code changes — control/Modbus logic is untouched
+
 ## 0.0.28
 - **Standalone Docker Support:**
   - Added `Dockerfile.standalone` for running outside of Home Assistant (e.g., on NAS/Unraid)
