@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.1.5
+- **Fix: control/sensors dead after the 0.1.4 update (`KeyError: 'DEVICE'`):**
+  - The image rebuild for 0.1.4 re-cloned the (unpinned) upstream, which meanwhile made a `[DEVICE]` config section (fan levels) mandatory. Our entrypoint only generated `[DEFAULT]`/`[MQTT]`/`[HA]`, so `ca350.py` crashed at startup before connecting to MQTT — every Comfoair entity went `unavailable` and could no longer be controlled. The 0.1.4 supervisor loop masked this as a silent restart storm instead of a hard failure.
+  - The entrypoint now generates the required `[DEVICE]` section in `config.ini`.
+  - New add-on options `fan_levels.*` (out/in absent/low/mid/high) and `setup_fan_levels_at_start` expose the upstream fan-level feature, defaulted to upstream values. `setup_fan_levels_at_start` defaults to **false** so the unit's fan calibration is **not** reprogrammed on boot (preserves prior behavior). Normal climate/level control does not depend on these values.
+- **Fix: self-healing supervisor never actually looped (broken since 0.1.4):**
+  - The entrypoint runs under bashio (`set -o errexit`). A bare `wait "${child_pid}"` on the crashing `ca350.py` aborted the script before the loop could iterate, so the "restarting in Ns" log, the backoff, and the `HEALTHY_RUNTIME` reset never ran — instead the whole container restarted every few seconds (exactly the `KeyError: 'DEVICE'` banner-loop seen in the add-on log).
+  - Fixed with `rc=0; wait "${child_pid}" || rc=$?`, and `|| true` on the `term_handler` kill/wait so a clean SIGTERM stop exits 0.
+- **Reproducible builds — upstream is now pinned:**
+  - The `git clone` of [hacomfoairmqtt](https://github.com/adorobis/hacomfoairmqtt) is pinned to a verified-compatible commit (`ARG HACOMFOAIRMQTT_REF`) instead of tracking HEAD, so a rebuild can no longer silently break the config contract again.
+  - `paho-mqtt` is pinned to `>=2.1,<3` (the pinned upstream uses the v2 callback API).
+- Upstream code itself remains untouched — this stays a wrapper-level change.
+
 ## 0.1.4
 - **Self-healing supervisor (no more manual restarts):**
   - The add-on entrypoint now runs `ca350.py` inside a restart-supervisor loop instead of as a one-shot command

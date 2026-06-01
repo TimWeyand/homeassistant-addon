@@ -1,6 +1,6 @@
 {
   "name": "Comfoair 2 MQTT",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "slug": "comfoair2mqtt",
   "description": "Control your Comfoair CA350 over MQTT",
   "uart": true,
@@ -36,7 +36,18 @@
     "HAAutoDiscoveryDeviceId": "ca350",
     "HAAutoDiscoveryDeviceName": "CA350",
     "HAAutoDiscoveryDeviceManufacturer": "Zehnder",
-    "HAAutoDiscoveryDeviceModel": "ComfoAir 350"
+    "HAAutoDiscoveryDeviceModel": "ComfoAir 350",
+    "fan_levels": {
+      "out_absent": 15,
+      "out_low": 25,
+      "out_mid": 40,
+      "out_high": 70,
+      "in_absent": 15,
+      "in_low": 25,
+      "in_mid": 40,
+      "in_high": 70
+    },
+    "setup_fan_levels_at_start": false
   },
   "schema": {
     "serial": "str?",
@@ -56,7 +67,18 @@
     "HAAutoDiscoveryDeviceId": "str?",
     "HAAutoDiscoveryDeviceName": "str?",
     "HAAutoDiscoveryDeviceManufacturer": "str?",
-    "HAAutoDiscoveryDeviceModel": "str?"
+    "HAAutoDiscoveryDeviceModel": "str?",
+    "fan_levels": {
+      "out_absent": "int?",
+      "out_low": "int?",
+      "out_mid": "int?",
+      "out_high": "int?",
+      "in_absent": "int?",
+      "in_low": "int?",
+      "in_mid": "int?",
+      "in_high": "int?"
+    },
+    "setup_fan_levels_at_start": "bool?"
   },
   "image": "tweyand/comfoair2mqtt-{arch}"
 }

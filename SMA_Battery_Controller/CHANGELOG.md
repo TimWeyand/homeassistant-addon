@@ -1,6 +1,13 @@
 # Changelog
 **Warning:** This is not an official add-on and is not affiliated with SMA. Use at your own risk. This software is experimental.
 
+## 0.0.30
+- **Fix: self-healing supervisor never actually looped (broken since 0.0.29):**
+  - `run.sh` runs under bashio, which enables `set -o errexit`. A bare `wait "${child_pid}"` on a non-zero exit aborted the whole script before the loop could iterate — so the backoff, the `HEALTHY_RUNTIME` reset and the restart log line never ran, and recovery fell back to a full container restart (no exponential backoff).
+  - Fixed by capturing the child exit code without tripping errexit: `rc=0; wait "${child_pid}" || rc=$?`.
+  - `term_handler` now also guards its `kill`/`wait` with `|| true` so a clean Home Assistant stop (SIGTERM) exits 0 instead of inheriting the child's non-zero code.
+  - No Go code changes.
+
 ## 0.0.29
 - **Self-healing supervisor (no more manual restarts):**
   - `run.sh` now runs the Go binary inside a restart-supervisor loop instead of `exec`

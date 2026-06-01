@@ -37,8 +37,8 @@ child_pid=""
 term_handler() {
     running=false
     if [ -n "${child_pid}" ]; then
-        kill -TERM "${child_pid}" 2>/dev/null
-        wait "${child_pid}" 2>/dev/null
+        kill -TERM "${child_pid}" 2>/dev/null || true
+        wait "${child_pid}" 2>/dev/null || true
     fi
     exit 0
 }
@@ -48,8 +48,11 @@ while [ "${running}" = true ]; do
     started=${SECONDS}
     /sma_battery_controller &
     child_pid=$!
-    wait "${child_pid}"
-    rc=$?
+    # bashio runs with `set -o errexit`; a bare `wait` on a non-zero child would
+    # abort this script (the loop would never iterate, no backoff, container would
+    # full-restart). `|| rc=$?` keeps the exit code without tripping errexit.
+    rc=0
+    wait "${child_pid}" || rc=$?
     if [ "${running}" != true ]; then
         break
     fi

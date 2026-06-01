@@ -62,6 +62,34 @@ else
   export COMFOAIR2MQTT_CONFIG_DiscoveryClimate="False";
 fi
 
+# Fan levels -> [DEVICE] section. Upstream ca350.py reads config['DEVICE'][...] at
+# module load time; without this section the script crashes immediately with
+# KeyError: 'DEVICE' (this is exactly what broke control after the upstream pulled
+# in the fan-level feature). Each value falls back to the upstream default if unset.
+fan_cfg() {
+  local val
+  val=$(bashio::config "fan_levels.${1}")
+  if [ -z "${val}" ] || [ "${val}" = "null" ]; then
+    echo "${2}"
+  else
+    echo "${val}"
+  fi
+}
+COMFOAIR2MQTT_FAN_OUT_ABSENT=$(fan_cfg 'out_absent' 15)
+COMFOAIR2MQTT_FAN_OUT_LOW=$(fan_cfg 'out_low' 25)
+COMFOAIR2MQTT_FAN_OUT_MID=$(fan_cfg 'out_mid' 40)
+COMFOAIR2MQTT_FAN_OUT_HIGH=$(fan_cfg 'out_high' 70)
+COMFOAIR2MQTT_FAN_IN_ABSENT=$(fan_cfg 'in_absent' 15)
+COMFOAIR2MQTT_FAN_IN_LOW=$(fan_cfg 'in_low' 25)
+COMFOAIR2MQTT_FAN_IN_MID=$(fan_cfg 'in_mid' 40)
+COMFOAIR2MQTT_FAN_IN_HIGH=$(fan_cfg 'in_high' 70)
+
+if bashio::var.true $(bashio::config 'setup_fan_levels_at_start'); then
+  COMFOAIR2MQTT_SETUP_FAN_LEVELS_AT_START="True";
+else
+  COMFOAIR2MQTT_SETUP_FAN_LEVELS_AT_START="False";
+fi
+
 
 cat <<EOF > "/opt/hacomfoairmqtt/src/config.ini"
 [DEFAULT]
@@ -70,6 +98,17 @@ RS485_protocol=$COMFOAIR2MQTT_CONFIG_RS485
 refresh_interval=$(bashio::config 'refresh_interval')
 enablePcMode=$COMFOAIR2MQTT_CONFIG_PCMode
 debug=$COMFOAIR2MQTT_CONFIG_debug
+
+[DEVICE]
+FanOutAbsent=$COMFOAIR2MQTT_FAN_OUT_ABSENT
+FanOutLow=$COMFOAIR2MQTT_FAN_OUT_LOW
+FanOutMid=$COMFOAIR2MQTT_FAN_OUT_MID
+FanOutHigh=$COMFOAIR2MQTT_FAN_OUT_HIGH
+FanInAbsent=$COMFOAIR2MQTT_FAN_IN_ABSENT
+FanInLow=$COMFOAIR2MQTT_FAN_IN_LOW
+FanInMid=$COMFOAIR2MQTT_FAN_IN_MID
+FanInHigh=$COMFOAIR2MQTT_FAN_IN_HIGH
+SetUpFanLevelsAtStart=$COMFOAIR2MQTT_SETUP_FAN_LEVELS_AT_START
 
 [MQTT]
 MQTTServer=$COMFOAIR2MQTT_CONFIG_MQTT_HOST
@@ -110,8 +149,8 @@ child_pid=""
 term_handler() {
     running=false
     if [ -n "${child_pid}" ]; then
-        kill -TERM "${child_pid}" 2>/dev/null
-        wait "${child_pid}" 2>/dev/null
+        kill -TERM "${child_pid}" 2>/dev/null || true
+        wait "${child_pid}" 2>/dev/null || true
     fi
     exit 0
 }
@@ -121,8 +160,11 @@ while [ "${running}" = true ]; do
     started=${SECONDS}
     python3 /opt/hacomfoairmqtt/src/ca350.py &
     child_pid=$!
-    wait "${child_pid}"
-    rc=$?
+    # bashio runs with `set -o errexit`; a bare `wait` on a non-zero child would
+    # abort this script (the loop would never iterate, no backoff, container would
+    # full-restart). `|| rc=$?` keeps the exit code without tripping errexit.
+    rc=0
+    wait "${child_pid}" || rc=$?
     if [ "${running}" != true ]; then
         break
     fi
