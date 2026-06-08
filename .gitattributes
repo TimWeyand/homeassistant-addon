@@ -1,0 +1,28 @@
+# This add-on repo is edited on Windows (core.autocrlf=true) but every script and
+# config here runs on Linux/Alpine inside Docker. CRLF line endings break the bash
+# interpreter (\r in the shebang and after every command) and corrupt the
+# heredoc-generated config.ini (e.g. "MQTTPort=1883\r" -> int() ValueError, the
+# exact crash class the 0.1.6 fix addresses). Force LF on checkout for all text
+# files so even a Windows working tree builds correct Linux images.
+* text=auto eol=lf
+
+# Explicit LF for the files executed inside the container (belt-and-suspenders).
+*.sh         text eol=lf
+Dockerfile*  text eol=lf
+*.yaml       text eol=lf
+*.yml        text eol=lf
+*.json       text eol=lf
+*.go         text eol=lf
+go.mod       text eol=lf
+go.sum       text eol=lf
+
+# Common binaries — never normalize (safety net if any get added later).
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.ico  binary
+*.zip  binary
+*.gz   binary
+*.tar  binary
+*.pdf  binary

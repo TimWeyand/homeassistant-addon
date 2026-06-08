@@ -90,6 +90,21 @@ else
   COMFOAIR2MQTT_SETUP_FAN_LEVELS_AT_START="False";
 fi
 
+# MQTT broker defaults for the manual `mqtt:` override path. `export_config 'mqtt'`
+# only exports the sub-keys the user actually set, and the service-discovery
+# fallback above runs ONLY when `mqtt` is left empty. So a user who points the
+# add-on at an external broker but omits port/keepalive (common — most only set
+# host/user/password) leaves these unset. Upstream ca350.py runs int(MQTTPort)/
+# int(MQTTKeepalive) at import time, so an empty value becomes int('') ->
+# ValueError -> immediate crash (masked as a restart loop by the supervisor
+# below) — the same failure class as the original KeyError: 'DEVICE'. Fill the
+# same defaults the discovery path uses. (`:=` triggers on unset OR empty and
+# `:` is errexit-safe.)
+: "${COMFOAIR2MQTT_CONFIG_MQTT_PORT:=1883}"
+: "${COMFOAIR2MQTT_CONFIG_MQTT_KEEPALIVE:=45}"
+if ! bashio::config.is_empty 'mqtt' && [ -z "${COMFOAIR2MQTT_CONFIG_MQTT_HOST}" ]; then
+  bashio::log.warning "Manual 'mqtt' config has no host set — MQTT connection will fail. Set mqtt.host or clear the mqtt option to use HA's MQTT service."
+fi
 
 cat <<EOF > "/opt/hacomfoairmqtt/src/config.ini"
 [DEFAULT]
@@ -125,6 +140,20 @@ HAAutoDiscoveryDeviceName=$(bashio::config 'HAAutoDiscoveryDeviceName')
 HAAutoDiscoveryDeviceManufacturer=$(bashio::config 'HAAutoDiscoveryDeviceManufacturer')
 HAAutoDiscoveryDeviceModel=$(bashio::config 'HAAutoDiscoveryDeviceModel')
 EOF
+
+# With debug enabled, echo the generated config.ini so a "settings not applied"
+# problem (empty/missing values like the MQTT or DEVICE crashes) is visible
+# straight from the add-on log without shelling into the container. The MQTT
+# password is masked so credentials never land in the log.
+if bashio::var.true "$(bashio::config 'debug')"; then
+  bashio::log.info "Generated config.ini:"
+  while IFS= read -r line; do
+    case "${line}" in
+      MQTTPassword=?*) bashio::log.info "MQTTPassword=***" ;;
+      *) bashio::log.info "${line}" ;;
+    esac
+  done < "/opt/hacomfoairmqtt/src/config.ini"
+fi
 
 bashio::log.info "Startup hacomfoairmqtt"
 

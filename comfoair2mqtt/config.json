@@ -1,6 +1,6 @@
 {
   "name": "Comfoair 2 MQTT",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "slug": "comfoair2mqtt",
   "description": "Control your Comfoair CA350 over MQTT",
   "uart": true,
