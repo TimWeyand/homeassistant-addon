@@ -1,6 +1,14 @@
 # Changelog
 **Warning:** This is not an official add-on and is not affiliated with SMA. Use at your own risk. This software is experimental.
 
+## 0.0.31
+- **New: `binary_sensor.internal_automatic` (visibility only, no control change):**
+  - Publishes a new MQTT discovery `binary_sensor` (`homeassistant/binary_sensor/<device_id>/internal_automatic/...`), `ON` while the add-on has internally switched the inverter to automatic (PV-aware override in "Pause (charge ok)" / "Charge Battery"), `OFF` otherwise. Retained state, initial `OFF` published right after discovery on startup.
+  - Backed by a new `setInternalAutomatic()` helper that wraps every existing `internalAutomatic` assignment and publishes only on an actual state change (no publish storm, no behavior change).
+  - **No change to the control/Modbus logic**: thresholds (grid feed > 500 W for "Charge Battery", > 100 W for "Pause (charge ok)"), revert conditions, SOC-based tapering, `spntCom`/`pwrAtCom` values, Modbus write order and timing are all untouched. Purely additive MQTT publishes.
+  - README documents the new sensor and spells out the switching/revert thresholds in plain language.
+  - New tests (`internal_automatic_test.go`) cover the publish helper (ON/OFF only on change, correct topic, retained) and the binary_sensor discovery payload (topics, `unique_id`, `name`, `availability`, `device`, `payload_on`/`payload_off`).
+
 ## 0.0.30
 - **Fix: self-healing supervisor never actually looped (broken since 0.0.29):**
   - `run.sh` runs under bashio, which enables `set -o errexit`. A bare `wait "${child_pid}"` on a non-zero exit aborted the whole script before the loop could iterate — so the backoff, the `HEALTHY_RUNTIME` reset and the restart log line never ran, and recovery fell back to a full container restart (no exponential backoff).

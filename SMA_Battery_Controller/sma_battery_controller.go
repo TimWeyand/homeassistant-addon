@@ -258,12 +258,39 @@ func publishDiscoveryMessages() {
 	publishSensor("modbus_error_count", "Modbus Error Count", "", deviceInfo)
 	publishSensor("internal_mode_reason", "Internal Mode Reason", "", deviceInfo)
 	publishSensor("actual_charging_power_setting", "Actual Charging Power Setting", "W", deviceInfo)
+	publishBinarySensor("internal_automatic", "Internal Automatic", deviceInfo)
 
 	// Publish initial values for the new sensors
 	stateTopic := sensorTopicPrefix + "internal_mode_reason/state"
 	mqttPublish(stateTopic, []byte("Starting"), false)
 	stateTopic = sensorTopicPrefix + "actual_charging_power_setting/state"
 	mqttPublish(stateTopic, []byte("0"), false)
+
+	// Initial state for the internal_automatic binary_sensor: always OFF right
+	// after discovery. This is a plain publish (not setInternalAutomatic),
+	// since internalAutomatic already defaults to false and the change-guard
+	// in setInternalAutomatic would otherwise skip the publish.
+	internalAutomatic = false
+	stateTopic = fmt.Sprintf("homeassistant/binary_sensor/%s/internal_automatic/state", deviceID)
+	mqttPublish(stateTopic, []byte("OFF"), true)
+}
+
+// setInternalAutomatic updates the internalAutomatic flag and publishes the
+// corresponding binary_sensor state (retained), but only when the value
+// actually changes. This does not alter any control/Modbus decision logic -
+// it is purely an additional, side-effect-free MQTT publish alongside the
+// existing internalAutomatic assignment it replaces.
+func setInternalAutomatic(value bool) {
+	if internalAutomatic == value {
+		return
+	}
+	internalAutomatic = value
+	payload := "OFF"
+	if value {
+		payload = "ON"
+	}
+	stateTopic := fmt.Sprintf("homeassistant/binary_sensor/%s/internal_automatic/state", deviceID)
+	mqttPublish(stateTopic, []byte(payload), true)
 }
 
 func publishSelect(objectID, name string, options []string, initial string, deviceInfo map[string]interface{}) {
@@ -336,6 +363,34 @@ func publishSensor(objectID, name, unit string, deviceInfo map[string]interface{
 		"value_template":      "{{ value }}",
 		"unique_id":           fmt.Sprintf("%s_%s", deviceID, objectID),
 		"device":              deviceInfo,
+		"availability": []map[string]string{
+			{
+				"topic":       "smastp_modbus/status",
+				"payload_on":  "online",
+				"payload_off": "offline",
+			},
+		},
+	}
+
+	payloadBytes, _ := json.Marshal(configPayload)
+	mqttPublish(configTopic, payloadBytes, true)
+}
+
+// publishBinarySensor publishes MQTT discovery config for a binary_sensor
+// entity. Unlike publishSensor it does not publish an initial state; the
+// state topic is written separately by the caller (see setInternalAutomatic
+// and the initial-OFF publish in publishDiscoveryMessages).
+func publishBinarySensor(objectID, name string, deviceInfo map[string]interface{}) {
+	configTopic := fmt.Sprintf("homeassistant/binary_sensor/%s/%s/config", deviceID, objectID)
+	stateTopic := fmt.Sprintf("homeassistant/binary_sensor/%s/%s/state", deviceID, objectID)
+
+	configPayload := map[string]interface{}{
+		"name":        name,
+		"state_topic": stateTopic,
+		"payload_on":  "ON",
+		"payload_off": "OFF",
+		"unique_id":   fmt.Sprintf("%s_%s", deviceID, objectID),
+		"device":      deviceInfo,
 		"availability": []map[string]string{
 			{
 				"topic":       "smastp_modbus/status",
@@ -575,7 +630,7 @@ func applyControlLogic() {
 
 	// Reset internal automatic state when mode changes
 	if currentMode != previousMode {
-		internalAutomatic = false
+		setInternalAutomatic(false)
 		if debugEnabled {
 			log.Printf("Mode changed from %s to %s, resetting internal automatic state", previousMode, currentMode)
 		}
@@ -678,7 +733,7 @@ func applyMode(mode string, spntCom *uint32, pwrAtCom *int32) {
 		if localGridFeed > 100 {
 			// Excess PV power available - switch to automatic to allow charging
 			if !internalAutomatic {
-				internalAutomatic = true
+				setInternalAutomatic(true)
 				publishInternalReason("Excess PV detected (grid feed > 100W), allowing automatic charging")
 				if debugEnabled {
 					log.Printf("Pause (charge ok): Switching internally to automatic - grid feed %dW", localGridFeed)
@@ -689,7 +744,7 @@ func applyMode(mode string, spntCom *uint32, pwrAtCom *int32) {
 			pauseActivated = false
 		} else if internalAutomatic && localBatteryDischargePower > 100 {
 			// Battery started discharging - switch back to pause
-			internalAutomatic = false
+			setInternalAutomatic(false)
 			publishInternalReason("Battery discharging detected, reverting to pause")
 			if debugEnabled {
 				log.Printf("Pause (charge ok): Battery discharging %dW, switching back to pause", localBatteryDischargePower)
@@ -714,7 +769,7 @@ func applyMode(mode string, spntCom *uint32, pwrAtCom *int32) {
 		pauseActivated = true
 		*spntCom = controlOn
 		*pwrAtCom = 0
-		internalAutomatic = false
+		setInternalAutomatic(false)
 		publishInternalReason("Pause mode active (no charging allowed)")
 		publishActualChargingPower(0)
 	case "Charge Battery":
@@ -726,7 +781,7 @@ func applyMode(mode string, spntCom *uint32, pwrAtCom *int32) {
 		if localGridFeed > 500 {
 			// Significant excess PV - switch to automatic for optimal charging
 			if !internalAutomatic {
-				internalAutomatic = true
+				setInternalAutomatic(true)
 				publishInternalReason(fmt.Sprintf("Excess PV detected (grid feed %dW > 500W), using automatic charging", localGridFeed))
 				if debugEnabled {
 					log.Printf("Charge Battery: Switching internally to automatic - grid feed %dW", localGridFeed)
@@ -738,7 +793,7 @@ func applyMode(mode string, spntCom *uint32, pwrAtCom *int32) {
 			publishActualChargingPower(localBatteryChargePower)
 		} else if internalAutomatic && localBatteryChargePower < (taperedPower-500) {
 			// Charging dropped below threshold - switch back to forced charge
-			internalAutomatic = false
+			setInternalAutomatic(false)
 			publishInternalReason(fmt.Sprintf("Charging dropped to %dW, forcing charge at %dW", localBatteryChargePower, taperedPower))
 			if debugEnabled {
 				log.Printf("Charge Battery: Charging only %dW, switching back to forced charge at %dW", localBatteryChargePower, taperedPower)
@@ -766,7 +821,7 @@ func applyMode(mode string, spntCom *uint32, pwrAtCom *int32) {
 		pauseActivated = false
 		*spntCom = controlOn
 		*pwrAtCom = int32(batteryControl)
-		internalAutomatic = false
+		setInternalAutomatic(false)
 		publishInternalReason(fmt.Sprintf("Forcing discharge at %dW", batteryControl))
 		publishActualChargingPower(0)
 	case "Balanced":
@@ -852,14 +907,14 @@ func applyMode(mode string, spntCom *uint32, pwrAtCom *int32) {
 			*pwrAtCom = 0
 		}
 		// Balanced mode doesn't use internal automatic switching
-		internalAutomatic = false
+		setInternalAutomatic(false)
 		publishInternalReason("Balanced mode active")
 		publishActualChargingPower(0)
 	default: // Automatic
 		pauseActivated = false
 		*spntCom = controlOff
 		*pwrAtCom = 0
-		internalAutomatic = false
+		setInternalAutomatic(false)
 		publishInternalReason("Automatic mode active")
 		// In automatic mode, show actual charging if happening
 		if localBatteryChargePower > 0 {
@@ -1094,7 +1149,9 @@ func mqttMessageHandler(client mqtt.Client, msg mqtt.Message) {
 	}
 }
 
-func mqttPublish(topic string, payload []byte, retain bool) {
+// mqttPublish is a package-level var (not a plain func) so tests can inject a
+// capturing stub instead of talking to a real MQTT broker.
+var mqttPublish = func(topic string, payload []byte, retain bool) {
 	token := mqttClient.Publish(topic, 0, retain, payload)
 	// For retained/config messages we wait; for high-frequency telemetry we don't block
 	if retain || debugEnabled {

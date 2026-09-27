@@ -114,6 +114,9 @@ The add-on uses MQTT auto-discovery to integrate with Home Assistant. After star
     - Internal Mode Reason (`sensor.internal_mode_reason`) - Explains internal automatic switching
     - Actual Charging Power Setting (`sensor.actual_charging_power_setting`) - Shows actual commanded power
 
+- **Binary Sensors**:
+    - Internal Automatic (`binary_sensor.sma_battery_controller_internal_automatic`) - `ON` while the add-on has internally switched the inverter to automatic (see "Internal PV-aware switching" below), `OFF` while it is actively enforcing the selected mode. Retained, so the last known state survives an add-on restart.
+
 - **Controls**:
     - Automatic Logic Selection (`select.automatic_logic_selection`)
     - Overwrite Logic Selection (`select.overwrite_logic_selection`)
@@ -149,6 +152,20 @@ The add-on uses MQTT auto-discovery to integrate with Home Assistant. After star
     - 95-100% SOC: Max 15% of maximum power
 
 - **Discharge Battery**: Forces the battery to discharge at the specified power level set in Battery Control.
+
+### Internal PV-aware switching (`binary_sensor.sma_battery_controller_internal_automatic`)
+
+In two modes the add-on temporarily lets the inverter run itself instead of enforcing the selected mode, so excess PV production is not wasted. The `Internal Automatic` binary sensor turns `ON` while this override is active and `OFF` while the add-on is actively enforcing the mode:
+
+- **Pause (charge ok)**:
+  - Switches internally to automatic when grid feed (export) is **> 100 W** (there is excess PV to charge with).
+  - Switches back to enforcing Pause once battery discharge power is **> 100 W** (the battery started discharging, which "Pause (charge ok)" must prevent).
+- **Charge Battery**:
+  - Switches internally to automatic when grid feed (export) is **> 500 W** (significant excess PV, better handled by the inverter's own MPP/charge logic).
+  - Switches back to enforcing the forced charge power once the battery's actual charge power drops below `(configured power − 500 W)` (the inverter is no longer charging fast enough on its own).
+- All other modes (`Automatic`, `Pause`, `Discharge Battery`, `Balanced`) never use this internal override; the sensor is `OFF` there.
+- The sensor also flips to `OFF` whenever the mode itself changes (Automatic/Overwrite Logic Selection), before the new mode's own switching rules take over.
+- This is purely a visibility feature: it does not add any new thresholds and does not change which Modbus commands are sent — see `internal_mode_reason` for the human-readable reason behind the current state.
 
 ## Important Notes
 
