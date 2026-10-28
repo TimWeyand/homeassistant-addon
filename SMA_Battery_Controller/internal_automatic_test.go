@@ -151,11 +151,11 @@ func TestPublishBinarySensor_DiscoveryPayload(t *testing.T) {
 		if got, want := availEntry["topic"], "smastp_modbus/status"; got != want {
 			t.Errorf("availability topic = %v, want %v", got, want)
 		}
-		if got, want := availEntry["payload_on"], "online"; got != want {
-			t.Errorf("availability payload_on = %v, want %v", got, want)
+		if got, want := availEntry["payload_available"], "online"; got != want {
+			t.Errorf("availability payload_available = %v, want %v", got, want)
 		}
-		if got, want := availEntry["payload_off"], "offline"; got != want {
-			t.Errorf("availability payload_off = %v, want %v", got, want)
+		if got, want := availEntry["payload_not_available"], "offline"; got != want {
+			t.Errorf("availability payload_not_available = %v, want %v", got, want)
 		}
 	})
 }

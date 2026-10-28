@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	mqtt "github.com/eclipse/paho.mqtt.golang"
@@ -25,8 +26,8 @@ type regDef struct {
 var (
 	mqttClient              mqtt.Client
 	modbusClient            modbus.Client
-	modbusClientErrorCount  int
-	modbusClientErrorTime   time.Time
+	modbusHandler           *modbus.TCPClientHandler // kept so a reconnect can close the old TCP connection
+	modbusClientErrorCount  atomic.Int32             // CONSECUTIVE Modbus failures; reset after a fully successful read cycle
 	maximumBatteryControl   int
 	modbusIntervalInSeconds int
 	debugEnabled            bool
@@ -37,12 +38,9 @@ var (
 	lastValidBatteryControl int
 	batteryDischargePower   int
 	batteryChargePower      int
-	previousMode            string
+	previousMode            string // last mode whose command was written successfully
 	deviceID                string
-	resetIntervalMinutes    int       // Reset interval
-	lastChangeTime          time.Time // Last change timestamp
-	initialValuesLoaded     bool      // Track if values are loaded
-	acPower                 int
+	resetIntervalMinutes    int // Reset interval
 	gridDraw                int
 	gridFeed                int
 	pauseActivated          bool
@@ -54,6 +52,18 @@ var (
 	internalAutomaticReason string // Reason for internal switching
 	actualChargingPower     int    // Actual charging power being commanded (after SOC tapering)
 
+	// Last SpntCom written successfully. Starts as controlOn ("unknown, maybe
+	// still forced by a previous run") so the first no-write decision releases it.
+	lastWrittenSpntCom uint32 = controlOn
+
+	// battery_control the user had before the overwrite switched INTO Balanced;
+	// restored when the overwrite leaves Balanced again.
+	savedUserBatteryControl      int
+	savedUserBatteryControlValid bool
+
+	// Set once startup (load, discovery, Modbus) is done; HA-restart republish waits for it.
+	startupDone atomic.Bool
+
 	// Flags for retained state loading
 	batteryControlLoaded     bool
 	automaticSelectionLoaded bool
@@ -63,25 +73,29 @@ var (
 	modbusMu  sync.Mutex
 	controlMu sync.Mutex
 	sensorMu  sync.Mutex // Protects sensor value globals
+	readMu    sync.Mutex // Serializes readAndPublishData (protects lastSensorValues)
+	// Lock order: controlMu -> readMu -> sensorMu / modbusMu
 
 	// Cached topic prefixes
-	sensorTopicPrefix      string
-	selectStateTopicPrefix string
-	numberStateTopicPrefix string
+	sensorTopicPrefix string
 
-	// Cache of last published sensor values to avoid redundant publishes
+	// Cache of last published sensor values to avoid redundant publishes (guarded by readMu)
 	lastSensorValues map[string]string
+
+	// modbusReconnect is a var so tests can replace the real TCP reconnect.
+	modbusReconnect = setupModbus
 )
 
 const (
-	nearZeroW     = 30  // threshold to treat grid draw/feed as ~0
-	chargeActiveW = 500 // threshold to consider charging actively happening
+	nearZeroW       = 30  // threshold to treat grid draw/feed as ~0
+	chargeActiveW   = 500 // threshold to consider charging actively happening
+	maxModbusErrors = 20  // consecutive Modbus failures before exiting (run.sh supervisor restarts us)
+
+	controlOn  uint32 = 802 // SpntCom: external control active
+	controlOff uint32 = 803 // SpntCom: inverter automatic
 )
 
 func main() {
-	modbusClientErrorCount = 0
-	modbusClientErrorTime = time.Now()
-
 	// Load environment variables
 	loadConfig()
 
@@ -94,8 +108,11 @@ func main() {
 	// Publish MQTT discovery messages
 	publishDiscoveryMessages()
 
-	// Set up Modbus client
-	setupModbus()
+	// Set up Modbus client; at startup a failure exits so the run.sh supervisor restarts us
+	if err := setupModbus(); err != nil {
+		log.Fatalf("Modbus connection error: %v", err)
+	}
+	startupDone.Store(true)
 
 	// Start Modbus reading loop
 	go modbusReadLoop()
@@ -119,6 +136,10 @@ func loadConfig() {
 	modbusIntervalInSeconds, err = strconv.Atoi(getEnv("MODBUS_INTERVAL_IN_SECONDS", "5"))
 	if err != nil {
 		log.Fatalf("Invalid MODBUS_INTERVAL_IN_SECONDS: %v", err)
+	}
+	if modbusIntervalInSeconds <= 0 {
+		// time.NewTicker panics on a non-positive duration
+		modbusIntervalInSeconds = 5
 	}
 
 	debugEnabled, err = strconv.ParseBool(getEnv("DEBUG_ENABLED", "true"))
@@ -145,12 +166,9 @@ func loadConfig() {
 	currentLogicSelection = "Automatic"
 	lastValidBatteryControl = 0
 	previousMode = ""
-	lastChangeTime = time.Now()
 
 	// Precompute topic prefixes and initialize caches
 	sensorTopicPrefix = "homeassistant/sensor/" + deviceID + "/"
-	selectStateTopicPrefix = "homeassistant/select/" + deviceID + "/"
-	numberStateTopicPrefix = "homeassistant/number/" + deviceID + "/"
 	lastSensorValues = make(map[string]string, 24)
 }
 
@@ -207,6 +225,12 @@ func setupMQTT() {
 		} else {
 			log.Printf("[MQTT] Re-subscribed to: %s", listenTopic)
 		}
+
+		// After a Home Assistant restart ("online" birth) re-announce discovery and states
+		token = c.Subscribe("homeassistant/status", 0, haStatusHandler)
+		if token.Wait() && token.Error() != nil {
+			log.Printf("[MQTT] Error subscribing to homeassistant/status: %v", token.Error())
+		}
 	})
 
 	// Create and start MQTT client
@@ -217,48 +241,10 @@ func setupMQTT() {
 }
 
 func publishDiscoveryMessages() {
-	// Device information
-	deviceInfo := map[string]interface{}{
-		"identifiers":  []string{deviceID},
-		"manufacturer": "Custom",
-		"model":        "SMA Battery Controller",
-		"name":         "SMA Battery Controller",
-	}
-
-	// Always publish discovery for selects and number so HA can send commands
-	publishSelect("automatic_logic_selection", "Automatic Logic Selection", []string{"Automatic", "Balanced", "Pause (charge ok)", "Pause", "Charge Battery", "Discharge Battery"}, automaticLogicSelection, deviceInfo)
-	publishSelect("overwrite_logic_selection", "Overwrite Logic Selection", []string{"Off", "Automatic", "Balanced", "Pause (charge ok)", "Pause", "Charge Battery", "Discharge Battery"}, overwriteLogicSelection, deviceInfo)
-	// Make Current Logic Selection read-only by publishing as a sensor (no command topic)
-	publishSensor("current_logic_selection", "Current Logic Selection", "", deviceInfo)
-	// Remove old select-based Current Logic Selection entity by clearing its discovery and state
-	oldSelectConfigTopic := fmt.Sprintf("homeassistant/select/%s/current_logic_selection/config", deviceID)
-	mqttPublish(oldSelectConfigTopic, []byte(""), true)
-	oldSelectStateTopic := fmt.Sprintf("homeassistant/select/%s/current_logic_selection/state", deviceID)
-	mqttPublish(oldSelectStateTopic, []byte(""), true)
-
-	publishNumber("battery_control", "Battery Control", 0, float64(maximumBatteryControl), 100, float64(batteryControl), deviceInfo)
-
-	// Publish sensors regardless of initial state
-	publishSensor("battery_status", "Battery Status", "", deviceInfo)
-	publishSensor("battery_soc", "Battery State of Charge", "%", deviceInfo)
-	publishSensor("battery_temperature", "Battery Temperature", "°C", deviceInfo)
-	publishSensor("inverter_temperature", "Inverter Temperature", "°C", deviceInfo)
-	publishSensor("battery_diagnose_current_capacity", "Battery Health", "%", deviceInfo)
-	publishSensor("battery_charge_power", "Battery Charge Power", "W", deviceInfo)
-	publishSensor("battery_discharge_power", "Battery Discharge Power", "W", deviceInfo)
-	publishSensor("dc1_current", "DC1 Current", "A", deviceInfo)
-	publishSensor("dc1_voltage", "DC1 Voltage", "V", deviceInfo)
-	publishSensor("dc1_power", "DC1 Power", "W", deviceInfo)
-	publishSensor("dc2_current", "DC1 Current", "A", deviceInfo)
-	publishSensor("dc2_voltage", "DC1 Voltage", "V", deviceInfo)
-	publishSensor("dc2_power", "DC1 Power", "W", deviceInfo)
-	publishSensor("ac_power", "AC Power", "W", deviceInfo)
-	publishSensor("grid_feed", "Grid Feed Power", "W", deviceInfo)
-	publishSensor("grid_draw", "Grid Draw Power", "W", deviceInfo)
-	publishSensor("modbus_error_count", "Modbus Error Count", "", deviceInfo)
-	publishSensor("internal_mode_reason", "Internal Mode Reason", "", deviceInfo)
-	publishSensor("actual_charging_power_setting", "Actual Charging Power Setting", "W", deviceInfo)
-	publishBinarySensor("internal_automatic", "Internal Automatic", deviceInfo)
+	controlMu.Lock()
+	autoSel, overSel, bc := automaticLogicSelection, overwriteLogicSelection, batteryControl
+	controlMu.Unlock()
+	publishDiscoveryConfigs(autoSel, overSel, bc)
 
 	// Publish initial values for the new sensors
 	stateTopic := sensorTopicPrefix + "internal_mode_reason/state"
@@ -273,6 +259,90 @@ func publishDiscoveryMessages() {
 	internalAutomatic = false
 	stateTopic = fmt.Sprintf("homeassistant/binary_sensor/%s/internal_automatic/state", deviceID)
 	mqttPublish(stateTopic, []byte("OFF"), true)
+}
+
+// haStatusHandler reacts to Home Assistant's birth message. Runs the republish
+// in its own goroutine so the paho message router is not blocked.
+func haStatusHandler(client mqtt.Client, msg mqtt.Message) {
+	if string(msg.Payload()) == "online" && startupDone.Load() {
+		go republishAfterHARestart()
+	}
+}
+
+// republishAfterHARestart re-announces discovery configs and the current
+// states without touching any control state (internalAutomatic etc.).
+func republishAfterHARestart() {
+	controlMu.Lock()
+	autoSel, overSel, bc := automaticLogicSelection, overwriteLogicSelection, batteryControl
+	curSel, intAuto, reason, acp := currentLogicSelection, internalAutomatic, internalAutomaticReason, actualChargingPower
+	controlMu.Unlock()
+
+	log.Println("[MQTT] Home Assistant online - republishing discovery and states")
+	publishDiscoveryConfigs(autoSel, overSel, bc)
+	mqttPublish(fmt.Sprintf("homeassistant/sensor/%s/current_logic_selection/state", deviceID), []byte(curSel), true)
+	intAutoPayload := "OFF"
+	if intAuto {
+		intAutoPayload = "ON"
+	}
+	mqttPublish(fmt.Sprintf("homeassistant/binary_sensor/%s/internal_automatic/state", deviceID), []byte(intAutoPayload), true)
+	mqttPublish(sensorTopicPrefix+"internal_mode_reason/state", []byte(reason), false)
+	mqttPublish(sensorTopicPrefix+"actual_charging_power_setting/state", []byte(strconv.Itoa(acp)), false)
+	// Sensor states are not retained: force the next poll to publish all of them
+	resetSensorCache()
+}
+
+// resetSensorCache clears the publish cache so the next read cycle publishes every sensor.
+func resetSensorCache() {
+	readMu.Lock()
+	lastSensorValues = make(map[string]string, len(polledRegisters)+1)
+	readMu.Unlock()
+}
+
+// publishDiscoveryConfigs publishes all HA discovery configs plus the
+// select/number states passed in.
+func publishDiscoveryConfigs(autoSel, overSel string, bc int) {
+	// Device information
+	deviceInfo := map[string]interface{}{
+		"identifiers":  []string{deviceID},
+		"manufacturer": "Custom",
+		"model":        "SMA Battery Controller",
+		"name":         "SMA Battery Controller",
+	}
+
+	// Always publish discovery for selects and number so HA can send commands
+	publishSelect("automatic_logic_selection", "Automatic Logic Selection", []string{"Automatic", "Balanced", "Pause (charge ok)", "Pause", "Charge Battery", "Discharge Battery"}, autoSel, deviceInfo)
+	publishSelect("overwrite_logic_selection", "Overwrite Logic Selection", []string{"Off", "Automatic", "Balanced", "Pause (charge ok)", "Pause", "Charge Battery", "Discharge Battery"}, overSel, deviceInfo)
+	// Make Current Logic Selection read-only by publishing as a sensor (no command topic)
+	publishSensor("current_logic_selection", "Current Logic Selection", "", deviceInfo)
+	// Remove old select-based Current Logic Selection entity by clearing its discovery and state
+	oldSelectConfigTopic := fmt.Sprintf("homeassistant/select/%s/current_logic_selection/config", deviceID)
+	mqttPublish(oldSelectConfigTopic, []byte(""), true)
+	oldSelectStateTopic := fmt.Sprintf("homeassistant/select/%s/current_logic_selection/state", deviceID)
+	mqttPublish(oldSelectStateTopic, []byte(""), true)
+
+	publishNumber("battery_control", "Battery Control", 0, float64(maximumBatteryControl), 100, float64(bc), deviceInfo)
+
+	// Publish sensors regardless of initial state
+	publishSensor("battery_status", "Battery Status", "", deviceInfo)
+	publishSensor("battery_soc", "Battery State of Charge", "%", deviceInfo)
+	publishSensor("battery_temperature", "Battery Temperature", "°C", deviceInfo)
+	publishSensor("inverter_temperature", "Inverter Temperature", "°C", deviceInfo)
+	publishSensor("battery_diagnose_current_capacity", "Battery Health", "%", deviceInfo)
+	publishSensor("battery_charge_power", "Battery Charge Power", "W", deviceInfo)
+	publishSensor("battery_discharge_power", "Battery Discharge Power", "W", deviceInfo)
+	publishSensor("dc1_current", "DC1 Current", "A", deviceInfo)
+	publishSensor("dc1_voltage", "DC1 Voltage", "V", deviceInfo)
+	publishSensor("dc1_power", "DC1 Power", "W", deviceInfo)
+	publishSensor("dc2_current", "DC2 Current", "A", deviceInfo)
+	publishSensor("dc2_voltage", "DC2 Voltage", "V", deviceInfo)
+	publishSensor("dc2_power", "DC2 Power", "W", deviceInfo)
+	publishSensor("ac_power", "AC Power", "W", deviceInfo)
+	publishSensor("grid_feed", "Grid Feed Power", "W", deviceInfo)
+	publishSensor("grid_draw", "Grid Draw Power", "W", deviceInfo)
+	publishSensor("modbus_error_count", "Modbus Error Count", "", deviceInfo)
+	publishSensor("internal_mode_reason", "Internal Mode Reason", "", deviceInfo)
+	publishSensor("actual_charging_power_setting", "Actual Charging Power Setting", "W", deviceInfo)
+	publishBinarySensor("internal_automatic", "Internal Automatic", deviceInfo)
 }
 
 // setInternalAutomatic updates the internalAutomatic flag and publishes the
@@ -307,9 +377,9 @@ func publishSelect(objectID, name string, options []string, initial string, devi
 		"device":        deviceInfo,
 		"availability": []map[string]string{
 			{
-				"topic":       "smastp_modbus/status",
-				"payload_on":  "online",
-				"payload_off": "offline",
+				"topic":                 "smastp_modbus/status",
+				"payload_available":     "online",
+				"payload_not_available": "offline",
 			},
 		},
 	}
@@ -338,9 +408,9 @@ func publishNumber(objectID, name string, min, max, step, initial float64, devic
 		"device":              deviceInfo,
 		"availability": []map[string]string{
 			{
-				"topic":       "smastp_modbus/status",
-				"payload_on":  "online",
-				"payload_off": "offline",
+				"topic":                 "smastp_modbus/status",
+				"payload_available":     "online",
+				"payload_not_available": "offline",
 			},
 		},
 	}
@@ -365,9 +435,9 @@ func publishSensor(objectID, name, unit string, deviceInfo map[string]interface{
 		"device":              deviceInfo,
 		"availability": []map[string]string{
 			{
-				"topic":       "smastp_modbus/status",
-				"payload_on":  "online",
-				"payload_off": "offline",
+				"topic":                 "smastp_modbus/status",
+				"payload_available":     "online",
+				"payload_not_available": "offline",
 			},
 		},
 	}
@@ -393,9 +463,9 @@ func publishBinarySensor(objectID, name string, deviceInfo map[string]interface{
 		"device":      deviceInfo,
 		"availability": []map[string]string{
 			{
-				"topic":       "smastp_modbus/status",
-				"payload_on":  "online",
-				"payload_off": "offline",
+				"topic":                 "smastp_modbus/status",
+				"payload_available":     "online",
+				"payload_not_available": "offline",
 			},
 		},
 	}
@@ -404,7 +474,10 @@ func publishBinarySensor(objectID, name string, deviceInfo map[string]interface{
 	mqttPublish(configTopic, payloadBytes, true)
 }
 
-func setupModbus() {
+// setupModbus (re)creates the Modbus TCP client, closing a previous connection.
+// The new client is installed even if Connect fails: the goburrow handler
+// connects lazily on the next request, so the next poll simply retries.
+func setupModbus() error {
 	log.Printf("Setting up modbus")
 	// Create Modbus TCP client handler
 	handler := modbus.NewTCPClientHandler(
@@ -417,17 +490,28 @@ func setupModbus() {
 
 	// Connect to Modbus device
 	modbusMu.Lock()
-	err := handler.Connect()
-	if err != nil {
-		modbusMu.Unlock()
-		log.Fatalf("Modbus connection error: %v", err)
+	defer modbusMu.Unlock()
+	if modbusHandler != nil {
+		_ = modbusHandler.Close()
 	}
+	err := handler.Connect()
+	modbusHandler = handler
 	modbusClient = modbus.NewClient(handler)
-	modbusMu.Unlock()
-	currentTime := time.Now()
-	timeDiff := currentTime.Sub(modbusClientErrorTime)
-	if timeDiff > 30*time.Minute {
-		modbusClientErrorCount = 0
+	return err
+}
+
+// handleModbusError counts a consecutive Modbus failure, exits after
+// maxModbusErrors (run.sh restarts the process) and otherwise reconnects.
+// Caller must NOT hold modbusMu.
+func handleModbusError(err error) {
+	n := modbusClientErrorCount.Add(1)
+	if n > maxModbusErrors {
+		fmt.Fprintf(os.Stderr, "error: %d consecutive Modbus errors, terminating: %v\n", n, err)
+		os.Exit(1)
+	}
+	log.Printf("Modbus error %d/%d, reconnecting: %v", n, maxModbusErrors, err)
+	if rerr := modbusReconnect(); rerr != nil {
+		log.Printf("Modbus reconnect failed: %v", rerr)
 	}
 }
 
@@ -466,31 +550,13 @@ func modbusReadLoop() {
 		select {
 		case <-fastTicker.C:
 			// When Balanced overwrite is active AND we're actually in discharge activity, poll every second
-			if normalizeMode(overwriteLogicSelection) == "Balanced" {
-				// Active balanced discharge mode if:
-				// - battery_control > 0
-				// - not actively charging (battery_charge_power below threshold)
-				// - and either currently discharging or grid deviates from zero beyond nearZeroW
-				sensorMu.Lock()
-				localBatteryChargePower := batteryChargePower
-				localBatteryDischargePower := batteryDischargePower
-				localGridDraw := gridDraw
-				localGridFeed := gridFeed
-				sensorMu.Unlock()
-				if batteryControl > 0 && localBatteryChargePower < chargeActiveW && (localBatteryDischargePower > 0 || localGridDraw > nearZeroW || localGridFeed > nearZeroW) {
-					readAndPublishData()
-					checkPauseChargeOkMode()
-				}
+			if balancedDischargeActive() {
+				readAndPublishData()
+				checkPauseChargeOkMode()
 			}
 		case <-normalTicker.C:
 			// In non-Balanced modes (or Balanced but not actively discharging), poll at the configured interval
-			sensorMu.Lock()
-			localBatteryChargePower := batteryChargePower
-			localBatteryDischargePower := batteryDischargePower
-			localGridDraw := gridDraw
-			localGridFeed := gridFeed
-			sensorMu.Unlock()
-			if normalizeMode(overwriteLogicSelection) != "Balanced" || !(batteryControl > 0 && localBatteryChargePower < chargeActiveW && (localBatteryDischargePower > 0 || localGridDraw > nearZeroW || localGridFeed > nearZeroW)) {
+			if !balancedDischargeActive() {
 				readAndPublishData()
 				checkPauseChargeOkMode()
 			}
@@ -498,32 +564,43 @@ func modbusReadLoop() {
 			applyControlLogic()
 		case <-fullPublishTicker.C:
 			// Clear cache to force publish of all sensors, then read and publish immediately
-			lastSensorValues = make(map[string]string, len(polledRegisters)+1)
+			resetSensorCache()
 			readAndPublishData()
 		}
 	}
 }
 
+// balancedDischargeActive reports whether the Balanced overwrite is actively
+// discharging and therefore needs the fast 1s poll:
+// - overwrite is Balanced and battery_control > 0
+// - not actively charging (battery_charge_power below threshold)
+// - and either currently discharging or grid deviates from zero beyond nearZeroW
+func balancedDischargeActive() bool {
+	controlMu.Lock()
+	balanced := normalizeMode(overwriteLogicSelection) == "Balanced"
+	bc := batteryControl
+	controlMu.Unlock()
+	if !balanced || bc <= 0 {
+		return false
+	}
+	sensorMu.Lock()
+	defer sensorMu.Unlock()
+	return batteryChargePower < chargeActiveW && (batteryDischargePower > 0 || gridDraw > nearZeroW || gridFeed > nearZeroW)
+}
+
 func readAndPublishData() {
+	readMu.Lock()
+	defer readMu.Unlock()
 	for _, r := range polledRegisters {
 		modbusMu.Lock()
 		result, err := modbusClient.ReadInputRegisters(r.addr, 2)
 		modbusMu.Unlock()
 		if err != nil {
-			if debugEnabled {
-				log.Printf("Error reading %s register: %v", r.name, err)
-			}
-			modbusClientErrorCount++
-			modbusClientErrorTime = time.Now()
-			if modbusClientErrorCount < 20 {
-				log.Printf("Trying to reconnect because of %v", err)
-				time.Sleep(30 * time.Second)
-				setupModbus()
-			} else if modbusClientErrorCount > 20 {
-				fmt.Fprintf(os.Stderr, "error: %v\n", err)
-				os.Exit(1)
-			}
-			continue
+			log.Printf("Error reading %s register: %v", r.name, err)
+			// Abort this cycle; the next tick retries after the reconnect
+			handleModbusError(err)
+			publishModbusErrorCount()
+			return
 		}
 		value := int32(binary.BigEndian.Uint32(result))
 		valueFloat := float32(value)
@@ -537,7 +614,8 @@ func readAndPublishData() {
 		case "battery_temperature":
 			valueFloat = valueFloat * 0.1
 		case "inverter_temperature":
-			valueFloat = valueFloat * 0.01
+			// SMA TEMP format, 1 decimal like battery_temperature (HA history at x0.01 showed 3.0-4.7 "°C")
+			valueFloat = valueFloat * 0.1
 		case "battery_soc":
 			sensorMu.Lock()
 			batterySoc = int(value)
@@ -549,10 +627,6 @@ func readAndPublishData() {
 		case "battery_charge_power":
 			sensorMu.Lock()
 			batteryChargePower = int(value)
-			sensorMu.Unlock()
-		case "ac_power":
-			sensorMu.Lock()
-			acPower = int(value)
 			sensorMu.Unlock()
 		case "grid_feed":
 			sensorMu.Lock()
@@ -579,9 +653,15 @@ func readAndPublishData() {
 		}
 	}
 
-	// Publish modbus error count
+	// Full cycle succeeded: the error counter counts consecutive failures only
+	modbusClientErrorCount.Store(0)
+	publishModbusErrorCount()
+}
+
+// publishModbusErrorCount publishes the error counter if changed. Caller must hold readMu.
+func publishModbusErrorCount() {
 	stateTopic := sensorTopicPrefix + "modbus_error_count/state"
-	payload := strconv.FormatInt(int64(modbusClientErrorCount), 10)
+	payload := strconv.FormatInt(int64(modbusClientErrorCount.Load()), 10)
 	if last, ok := lastSensorValues["modbus_error_count"]; !ok || last != payload {
 		lastSensorValues["modbus_error_count"] = payload
 		mqttPublish(stateTopic, []byte(payload), false)
@@ -590,11 +670,25 @@ func readAndPublishData() {
 
 func checkPauseChargeOkMode() {
 	// Use normalized mode for case-insensitive comparison
-	currentMode := getCurrentMode()
+	controlMu.Lock()
+	currentMode := getCurrentModeUnsafe()
 	normalizedOverwrite := normalizeMode(overwriteLogicSelection)
+	// A mode change not yet applied (e.g. a failed write) is retried on the next poll tick
+	modePending := currentMode != previousMode
+	if currentMode == "Automatic" {
+		// No command is re-applied in Automatic, so keep the displayed charge power live here
+		sensorMu.Lock()
+		chargePower := batteryChargePower
+		sensorMu.Unlock()
+		if chargePower < 0 { // SMA NaN marker (0x80000000) reads as negative
+			chargePower = 0
+		}
+		publishActualChargingPower(chargePower)
+	}
+	controlMu.Unlock()
 
 	// Continuously react in Balanced only when Overwrite is actively set to Balanced (not in Automatic mode)
-	if normalizedOverwrite == "Balanced" {
+	if normalizedOverwrite == "Balanced" || modePending {
 		applyControlLogic()
 		return
 	}
@@ -652,27 +746,55 @@ func applyControlLogic() {
 		return
 	}
 
-	previousMode = currentMode
+	// "No write" must not leave an earlier forced command (802) active on the
+	// inverter, e.g. entering Balanced during a forced charge: release it once.
+	if spntCom == 0 && lastWrittenSpntCom == controlOn {
+		spntCom = controlOff
+		pwrAtCom = 0
+	}
 
 	if spntCom != 0 {
 		// Write control commands to Modbus
-		writeControlCommands(spntCom, pwrAtCom)
+		if err := writeControlCommands(spntCom, pwrAtCom); err != nil {
+			// previousMode stays unchanged, so the next evaluation retries
+			// (also in Automatic, where shouldApply relies on the mode change).
+			log.Printf("Control command not applied, will retry: %v", err)
+		} else {
+			lastWrittenSpntCom = spntCom
+			previousMode = currentMode
+		}
 		// Give inverter a brief moment to apply new settings before reading back
 		// In Balanced mode we must react quickly based on grid values: skip the post_command delay
 		if currentMode != "Balanced" {
 			time.Sleep(time.Duration(postCommandDelayMs) * time.Millisecond)
 		}
+	} else {
+		previousMode = currentMode
 	}
 	// Always read and publish after evaluating/applying control changes
 	readAndPublishData()
 }
 
-func applyMode(mode string, spntCom *uint32, pwrAtCom *int32) {
-	const (
-		controlOn  uint32 = 802
-		controlOff uint32 = 803
-	)
+// publishInternalReason publishes internal_mode_reason if changed. Caller must hold controlMu.
+func publishInternalReason(reason string) {
+	if internalAutomaticReason != reason {
+		internalAutomaticReason = reason
+		stateTopic := sensorTopicPrefix + "internal_mode_reason/state"
+		mqttPublish(stateTopic, []byte(reason), false)
+	}
+}
 
+// publishActualChargingPower publishes actual_charging_power_setting if changed. Caller must hold controlMu.
+func publishActualChargingPower(power int) {
+	if actualChargingPower != power {
+		actualChargingPower = power
+		stateTopic := sensorTopicPrefix + "actual_charging_power_setting/state"
+		mqttPublish(stateTopic, []byte(strconv.Itoa(power)), false)
+	}
+}
+
+// applyMode decides SpntCom/PwrAtCom for mode. Caller must hold controlMu.
+func applyMode(mode string, spntCom *uint32, pwrAtCom *int32) {
 	// Read sensor values atomically
 	sensorMu.Lock()
 	localBatterySoc := batterySoc
@@ -707,24 +829,6 @@ func applyMode(mode string, spntCom *uint32, pwrAtCom *int32) {
 			return maxAllowed
 		}
 		return requestedPower
-	}
-
-	// Helper function to publish internal mode reason
-	publishInternalReason := func(reason string) {
-		if internalAutomaticReason != reason {
-			internalAutomaticReason = reason
-			stateTopic := sensorTopicPrefix + "internal_mode_reason/state"
-			mqttPublish(stateTopic, []byte(reason), false)
-		}
-	}
-
-	// Helper function to publish actual charging power
-	publishActualChargingPower := func(power int) {
-		if actualChargingPower != power {
-			actualChargingPower = power
-			stateTopic := sensorTopicPrefix + "actual_charging_power_setting/state"
-			mqttPublish(stateTopic, []byte(strconv.Itoa(power)), false)
-		}
 	}
 
 	switch mode {
@@ -776,6 +880,11 @@ func applyMode(mode string, spntCom *uint32, pwrAtCom *int32) {
 		pauseActivated = false
 		// Apply SOC-based tapering
 		taperedPower := calculateTaperedCharge(batteryControl)
+		// Revert threshold: tapered-500 is unreachable for setpoints <= 500 W, so use at least half the setpoint
+		revertBelow := taperedPower - 500
+		if half := taperedPower / 2; half > revertBelow {
+			revertBelow = half
+		}
 
 		// Check if we should switch internally to automatic
 		if localGridFeed > 500 {
@@ -791,7 +900,7 @@ func applyMode(mode string, spntCom *uint32, pwrAtCom *int32) {
 			*pwrAtCom = 0
 			// In automatic mode, show what the inverter is doing
 			publishActualChargingPower(localBatteryChargePower)
-		} else if internalAutomatic && localBatteryChargePower < (taperedPower-500) {
+		} else if internalAutomatic && localBatteryChargePower < revertBelow {
 			// Charging dropped below threshold - switch back to forced charge
 			setInternalAutomatic(false)
 			publishInternalReason(fmt.Sprintf("Charging dropped to %dW, forcing charge at %dW", localBatteryChargePower, taperedPower))
@@ -925,7 +1034,9 @@ func applyMode(mode string, spntCom *uint32, pwrAtCom *int32) {
 	}
 }
 
-func writeControlCommands(spntCom uint32, pwrAtCom int32) {
+// writeControlCommands writes SpntCom (40151) and PwrAtCom (40149). A non-nil
+// error means the command is not (fully) applied and must be retried.
+func writeControlCommands(spntCom uint32, pwrAtCom int32) error {
 	modbusMu.Lock()
 	// Write to register 40151 (Communication control)
 	spntComData := uint32ToBytes(spntCom)
@@ -934,17 +1045,10 @@ func writeControlCommands(spntCom uint32, pwrAtCom int32) {
 	}
 	_, err := modbusClient.WriteMultipleRegisters(40151, 2, spntComData)
 	if err != nil {
-		modbusMu.Unlock() // Unlock before setupModbus to avoid deadlock
+		modbusMu.Unlock() // Unlock before reconnect to avoid deadlock
 		log.Printf("Error writing to register 40151: %v", err)
-		modbusClientErrorCount++
-		modbusClientErrorTime = time.Now()
-		if modbusClientErrorCount < 5 {
-			time.Sleep(30 * time.Second)
-			setupModbus()
-		} else {
-			log.Fatalf("To many modbus errors, have to terminate %v", err)
-		}
-		return
+		handleModbusError(err)
+		return err
 	}
 	time.Sleep(100 * time.Millisecond)
 
@@ -957,53 +1061,52 @@ func writeControlCommands(spntCom uint32, pwrAtCom int32) {
 	modbusMu.Unlock() // Unlock after both writes complete or on error
 	if err != nil {
 		log.Printf("Error writing to register 40149: %v", err)
-		modbusClientErrorCount++
-		modbusClientErrorTime = time.Now()
-		if modbusClientErrorCount < 5 {
-			time.Sleep(30 * time.Second)
-			setupModbus()
-		} else {
-			log.Fatalf("To many modbus errors, have to terminate %v", err)
-		}
-		return
+		handleModbusError(err)
+		return err
 	}
 	if debugEnabled {
 		log.Printf("Control command sent: SpntCom=%d, PwrAtCom=%d", spntCom, pwrAtCom)
 	}
+	return nil
 }
 
 func loadInitialSettings() {
 	// Subscribe to retained state topics
-	stateTopic := fmt.Sprintf("homeassistant/select/%s/automatic_logic_selection/state", deviceID)
-	token := mqttClient.Subscribe(stateTopic, 0, func(client mqtt.Client, msg mqtt.Message) {
+	autoTopic := fmt.Sprintf("homeassistant/select/%s/automatic_logic_selection/state", deviceID)
+	token := mqttClient.Subscribe(autoTopic, 0, func(client mqtt.Client, msg mqtt.Message) {
+		controlMu.Lock()
 		automaticLogicSelection = string(msg.Payload())
 		automaticSelectionLoaded = true
+		controlMu.Unlock()
 		if debugEnabled {
-			log.Printf("Loaded automatic_logic_selection from MQTT: %s", automaticLogicSelection)
+			log.Printf("Loaded automatic_logic_selection from MQTT: %s", msg.Payload())
 		}
 	})
 	token.Wait()
 
-	stateTopic = fmt.Sprintf("homeassistant/select/%s/overwrite_logic_selection/state", deviceID)
-	token = mqttClient.Subscribe(stateTopic, 0, func(client mqtt.Client, msg mqtt.Message) {
+	overTopic := fmt.Sprintf("homeassistant/select/%s/overwrite_logic_selection/state", deviceID)
+	token = mqttClient.Subscribe(overTopic, 0, func(client mqtt.Client, msg mqtt.Message) {
+		controlMu.Lock()
 		overwriteLogicSelection = string(msg.Payload())
 		overwriteSelectionLoaded = true
+		controlMu.Unlock()
 		if debugEnabled {
-			log.Printf("Loaded overwrite_logic_selection from MQTT: %s", overwriteLogicSelection)
+			log.Printf("Loaded overwrite_logic_selection from MQTT: %s", msg.Payload())
 		}
 	})
 	token.Wait()
 
-	stateTopic = fmt.Sprintf("homeassistant/number/%s/battery_control/state", deviceID)
-	token = mqttClient.Subscribe(stateTopic, 0, func(client mqtt.Client, msg mqtt.Message) {
+	bcTopic := fmt.Sprintf("homeassistant/number/%s/battery_control/state", deviceID)
+	token = mqttClient.Subscribe(bcTopic, 0, func(client mqtt.Client, msg mqtt.Message) {
 		value, err := strconv.Atoi(string(msg.Payload()))
 		if err == nil {
+			controlMu.Lock()
 			batteryControl = value
-			lastValidBatteryControl = value
 			batteryControlLoaded = true
+			controlMu.Unlock()
 		}
 		if debugEnabled {
-			log.Printf("Loaded battery_control from MQTT: %d", batteryControl)
+			log.Printf("Loaded battery_control from MQTT: %s", msg.Payload())
 		}
 	})
 	token.Wait()
@@ -1012,20 +1115,42 @@ func loadInitialSettings() {
 	// This is still not perfect but better than the original
 	time.Sleep(1 * time.Second)
 
-	// Set defaults if no values are loaded from retained messages
-	if !automaticSelectionLoaded || automaticLogicSelection == "" {
+	// Stop listening: later echoes of our own retained publishes must not overwrite the globals
+	if token = mqttClient.Unsubscribe(autoTopic, overTopic, bcTopic); token.Wait() && token.Error() != nil {
+		log.Printf("[MQTT] Error unsubscribing startup state topics: %v", token.Error())
+	}
+
+	controlMu.Lock()
+	normalizeLoadedSettings()
+	controlMu.Unlock()
+}
+
+// normalizeLoadedSettings applies defaults, mode normalization and the
+// battery_control clamp to the values loaded from retained MQTT state.
+// Caller must hold controlMu.
+func normalizeLoadedSettings() {
+	if !automaticSelectionLoaded {
 		automaticLogicSelection = "Automatic"
 	}
-	if !overwriteSelectionLoaded || overwriteLogicSelection == "" {
+	automaticLogicSelection = normalizeMode(automaticLogicSelection)
+	if automaticLogicSelection == "Off" { // "Off" is only valid for the overwrite select
+		automaticLogicSelection = "Automatic"
+	}
+	if !overwriteSelectionLoaded || strings.TrimSpace(overwriteLogicSelection) == "" {
 		overwriteLogicSelection = "Off"
 	}
+	overwriteLogicSelection = normalizeMode(overwriteLogicSelection)
+
 	if !batteryControlLoaded {
 		// Set default battery control to 90% of maximumBatteryControl
 		batteryControl = int(math.Round(float64(maximumBatteryControl) * 0.90))
-		lastValidBatteryControl = batteryControl
 	}
-
-	initialValuesLoaded = true // Mark that initial values have been loaded
+	if batteryControl < 0 {
+		batteryControl = 0
+	} else if batteryControl > maximumBatteryControl {
+		batteryControl = maximumBatteryControl
+	}
+	lastValidBatteryControl = batteryControl
 }
 
 func mqttMessageHandler(client mqtt.Client, msg mqtt.Message) {
@@ -1060,13 +1185,27 @@ func mqttMessageHandler(client mqtt.Client, msg mqtt.Message) {
 			stateTopic := fmt.Sprintf("homeassistant/select/%s/%s/state", deviceID, objectID)
 			mqttPublish(stateTopic, []byte(normalizedPayload), true)
 			applyControlLogic()
-			lastChangeTime = time.Now()
 		} else if objectID == "overwrite_logic_selection" {
 			// Normalize the mode for case-insensitive matching
 			normalizedPayload := normalizeMode(payload)
+			// Save/restore, Balanced init and the overwrite switch happen in ONE
+			// controlMu section, so a poll tick never sees a half-applied change.
+			controlMu.Lock()
+			wasBalanced := normalizeMode(overwriteLogicSelection) == "Balanced"
+			if normalizedPayload == "Balanced" && !wasBalanced {
+				// Balanced rewrites battery_control dynamically: remember the user's value
+				savedUserBatteryControl = batteryControl
+				savedUserBatteryControlValid = true
+			}
+			publishBC := -1
+			if normalizedPayload != "Balanced" && wasBalanced && savedUserBatteryControlValid {
+				batteryControl = savedUserBatteryControl
+				lastValidBatteryControl = savedUserBatteryControl
+				savedUserBatteryControlValid = false
+				publishBC = batteryControl
+			}
 			// If switching to Balanced, initialize battery_control to 0 or the required discharge value
 			if normalizedPayload == "Balanced" {
-				// Determine initial battery control for Balanced
 				var newBC int
 				sensorMu.Lock()
 				localBatteryChargePower := batteryChargePower
@@ -1083,26 +1222,21 @@ func mqttMessageHandler(client mqtt.Client, msg mqtt.Message) {
 				} else {
 					newBC = 0
 				}
-				// Protect write access to global variables
-				controlMu.Lock()
 				if batteryControl != newBC {
 					batteryControl = newBC
 					lastValidBatteryControl = newBC
-					controlMu.Unlock()
-					bcStateTopic := fmt.Sprintf("homeassistant/number/%s/%s/state", deviceID, "battery_control")
-					mqttPublish(bcStateTopic, []byte(strconv.Itoa(newBC)), true)
-				} else {
-					controlMu.Unlock()
+					publishBC = newBC
 				}
 			}
-			// Protect write access to global variable
-			controlMu.Lock()
 			overwriteLogicSelection = normalizedPayload
 			controlMu.Unlock()
+			if publishBC >= 0 {
+				bcStateTopic := fmt.Sprintf("homeassistant/number/%s/%s/state", deviceID, "battery_control")
+				mqttPublish(bcStateTopic, []byte(strconv.Itoa(publishBC)), true)
+			}
 			stateTopic := fmt.Sprintf("homeassistant/select/%s/%s/state", deviceID, objectID)
 			mqttPublish(stateTopic, []byte(normalizedPayload), true)
 			applyControlLogic()
-			lastChangeTime = time.Now()
 		}
 	case "number":
 		if objectID == "battery_control" {
@@ -1133,7 +1267,6 @@ func mqttMessageHandler(client mqtt.Client, msg mqtt.Message) {
 				stateTopic := fmt.Sprintf("homeassistant/number/%s/%s/state", deviceID, objectID)
 				mqttPublish(stateTopic, []byte(payload), true)
 				applyControlLogic()
-				lastChangeTime = time.Now()
 			} else {
 				// Reset to last valid value
 				controlMu.Lock()

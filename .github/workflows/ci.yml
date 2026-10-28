@@ -1,24 +1,67 @@
 name: AddOnRelease
 
-on: [push, pull_request]
+# Tests run on every PR and every push to main. Images are published ONLY on a
+# push to main; PR runs just build (no push, no registry login).
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
+  # Quality gate for the SMA Go add-on: vet, race tests, vulnerability scan
+  sma_battery_test:
+    name: Test SMA Battery Controller
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: SMA_Battery_Controller
+    steps:
+      - name: Checkout the repository
+        uses: actions/checkout@v6
+
+      - name: Set up Go (version from go.mod)
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: SMA_Battery_Controller/go.mod
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test -race -count=1 ./...
+
+      # Separate setup on the newest stable toolchain: govulncheck also scans the
+      # stdlib, and go.mod pins only the minimum (the Dockerfiles ship a current patch release).
+      - name: Set up Go (stable, for govulncheck)
+        uses: actions/setup-go@v6
+        with:
+          go-version: stable
+
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+
   # Standalone Docker image (for NAS/Docker deployments)
   sma_battery_standalone:
     name: Build Standalone SMA Battery Controller
+    needs: sma_battery_test
     runs-on: ubuntu-latest
     steps:
       - name: Checkout the repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@v4
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Login to DockerHub
-        uses: docker/login-action@v3
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: docker/login-action@v4
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB }}
@@ -27,15 +70,15 @@ jobs:
         id: version
         run: |
           VERSION=$(jq -r '.version' SMA_Battery_Controller/config.json)
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
-      - name: Build and push standalone image
-        uses: docker/build-push-action@v5
+      - name: Build (and push on main) standalone image
+        uses: docker/build-push-action@v7
         with:
           context: ./SMA_Battery_Controller
           file: ./SMA_Battery_Controller/Dockerfile.standalone
           platforms: linux/amd64,linux/arm64
-          push: true
+          push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
           tags: |
             tweyand/sma-battery-controller:latest
             tweyand/sma-battery-controller:${{ steps.version.outputs.version }}
@@ -43,41 +86,74 @@ jobs:
           cache-to: type=gha,mode=max
 
   # Home Assistant Add-on (for HA installations)
+  # NOTE: home-assistant/builder is deprecated upstream (migration to the new
+  # BuildKit actions is a separate task); @2026.02.1 is the last official release
+  # and what @master resolved to anyway.
   sma_battery_publish:
     name: Publish SMA Battery Controller
+    needs: sma_battery_test
     runs-on: ubuntu-latest
     steps:
       - name: Checkout the repository
-        uses: actions/checkout@v3
-      - name: Login to DockerHub
-        uses: docker/login-action@v2
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME}}
-          password: ${{ secrets.DOCKERHUB }}
-      - name: Publish
-        uses: home-assistant/builder@master
+        uses: actions/checkout@v6
+
+      - name: Build only (no push)
+        if: github.event_name != 'push' || github.ref != 'refs/heads/main'
+        uses: home-assistant/builder@2026.02.1
         with:
           args: |
             --amd64 \
             --aarch64 \
             --target SMA_Battery_Controller \
-            --docker-hub ${{ secrets.DOCKERHUB_USERNAME}}
+            --test
+
+      - name: Login to DockerHub
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB }}
+
+      - name: Publish
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: home-assistant/builder@2026.02.1
+        with:
+          args: |
+            --amd64 \
+            --aarch64 \
+            --target SMA_Battery_Controller \
+            --docker-hub ${{ secrets.DOCKERHUB_USERNAME }}
+
   comfoair_publish:
     name: Publish Comfoair2MQTT
     runs-on: ubuntu-latest
     steps:
       - name: Checkout the repository
-        uses: actions/checkout@v3
-      - name: Login to DockerHub
-        uses: docker/login-action@v2
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME}}
-          password: ${{ secrets.DOCKERHUB }}
-      - name: Publish
-        uses: home-assistant/builder@master
+        uses: actions/checkout@v6
+
+      - name: Build only (no push)
+        if: github.event_name != 'push' || github.ref != 'refs/heads/main'
+        uses: home-assistant/builder@2026.02.1
         with:
           args: |
             --amd64 \
             --aarch64 \
             --target comfoair2mqtt \
-            --docker-hub ${{ secrets.DOCKERHUB_USERNAME}}
+            --test
+
+      - name: Login to DockerHub
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB }}
+
+      - name: Publish
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: home-assistant/builder@2026.02.1
+        with:
+          args: |
+            --amd64 \
+            --aarch64 \
+            --target comfoair2mqtt \
+            --docker-hub ${{ secrets.DOCKERHUB_USERNAME }}

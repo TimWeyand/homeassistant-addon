@@ -2,7 +2,7 @@
 # Use this for running outside of Home Assistant (e.g., on a NAS)
 
 # Build stage
-FROM golang:1.21-alpine AS builder
+FROM golang:1.27.3-alpine AS builder
 
 WORKDIR /app
 
@@ -11,11 +11,11 @@ COPY go.mod go.sum ./
 RUN go mod download
 
 # Copy source code and build
-COPY sma_battery_controller.go ./
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o sma_battery_controller .
+COPY *.go ./
+RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o sma_battery_controller .
 
 # Runtime stage - minimal image
-FROM alpine:3.19
+FROM alpine:3.24
 
 RUN apk add --no-cache ca-certificates tzdata
 

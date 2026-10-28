@@ -13,14 +13,14 @@ services:
     container_name: sma-battery-controller
     restart: unless-stopped
     environment:
-      # MQTT Configuration
-      - MQTT_SERVER_ADDRESS=mqtt.home.weyand.biz
+      # MQTT Configuration (replace the <placeholders>; never commit real credentials)
+      - MQTT_SERVER_ADDRESS=<mqtt-broker-host>
       - MQTT_SERVER_PORT=1883
-      - MQTT_USER=power
-      - MQTT_PASSWORD=power
+      - MQTT_USER=<mqtt-user>
+      - MQTT_PASSWORD=<mqtt-password>
 
       # SMA Inverter Modbus Configuration
-      - SMA_INVERTER_MODBUS_ADDRESS=192.168.250.24
+      - SMA_INVERTER_MODBUS_ADDRESS=<inverter-ip>
       - SMA_INVERTER_MODBUS_PORT=502
 
       # Battery Control Settings
